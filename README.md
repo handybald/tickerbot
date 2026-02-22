@@ -1,0 +1,104 @@
+# Ticker Bot
+
+A stock trading bot with CLI analysis modes and a Telegram-driven paper trading service focused on BIST/BIST30.
+
+## Features
+
+- **Suggestion Mode**: Get trading suggestions for a stock based on technical indicators and news sentiment.
+- **Automatic Mode**: Run the bot in automatic trading mode with configurable parameters.
+- **Backtesting**: Backtest your trading strategies on historical data.
+- **Run Mode (Telegram + Paper Trading)**:
+  - BIST30 plus auto-synced BIST universe cache
+  - Optional US/NASDAQ universe mode
+  - Paper broker (no real money orders)
+  - Persistent runtime state (cash, open positions, strategy) across restarts
+  - Fees, slippage, and optional partial fills in simulation
+  - Auto strategy/timeframe selection
+  - Stop-loss, take-profit, trailing stop, max holding period
+  - Market regime filter and liquidity gates
+  - Cooldown + max entry limits to reduce overtrading
+  - Dynamic confidence threshold and strategy performance bias
+  - Bad-symbol quarantine for repeated no-data tickers
+  - Optional pre-close flattening
+  - Dynamic settings via Telegram commands
+  - Daily report at 18:00 GMT+3, weekly summary, and on-demand report commands
+
+## Installation
+
+```bash
+pip install .
+```
+
+## Usage
+
+```bash
+tickerbot suggestion AAPL
+tickerbot automatic --daily-limit 2000 --aggressiveness 0.7 --target-profit 150
+tickerbot backtest rsi AAPL
+```
+
+## Telegram Paper Trading Mode
+
+Set environment variables:
+
+```bash
+cp .env.example .env
+# edit .env with your real values
+```
+
+Run:
+
+```bash
+tickerbot run --initial-cash 100000
+```
+
+`run` mode loads `.env` automatically.
+
+Telegram commands:
+
+```text
+/help
+/status
+/report
+/weeklyreport
+/debugsignals [n]
+/positions
+/settings
+/set <key> <value>
+/syncuniverse
+/tradescsv [days]
+/startbot
+/stopbot
+```
+
+Examples:
+
+```text
+/set market_scope BIST30
+/set market_scope NASDAQ
+/set regime_ticker QQQ
+/set max_open_positions 7
+/set per_trade_cash_pct 0.04
+/set max_daily_loss_pct 0.03
+/set trade_period_minutes 60
+/set fee_bps 10
+/set slippage_bps 5
+/set partial_fill_enabled true
+/set universe_refresh_minutes 720
+/set weekly_report_weekday 4
+/set stop_loss_pct 0.01
+/set take_profit_pct 0.015
+/set trailing_stop_pct 0.008
+/set max_holding_minutes 1440
+/set max_new_entries_per_cycle 3
+/set max_new_entries_per_day 10
+/set ticker_cooldown_minutes 60
+/set min_signal_confidence 0.45
+/set regime_filter_enabled true
+/set intraday_flatten_enabled true
+/set flatten_hour_gmt3 17
+/set flatten_minute_gmt3 55
+```
+
+`weekly_report_weekday` uses Python weekday convention:
+`0=Monday ... 4=Friday ... 6=Sunday`.

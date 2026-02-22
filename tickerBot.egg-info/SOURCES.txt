@@ -1,0 +1,15 @@
+README.md
+setup.py
+tickerBot.egg-info/PKG-INFO
+tickerBot.egg-info/SOURCES.txt
+tickerBot.egg-info/dependency_links.txt
+tickerBot.egg-info/entry_points.txt
+tickerBot.egg-info/requires.txt
+tickerBot.egg-info/top_level.txt
+tickerbot/__init__.py
+tickerbot/backtester.py
+tickerbot/data_fetcher.py
+tickerbot/indicators.py
+tickerbot/main.py
+tickerbot/suggestion.py
+tickerbot/trader.py

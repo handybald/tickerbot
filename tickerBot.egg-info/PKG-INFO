@@ -1,0 +1,56 @@
+Metadata-Version: 2.4
+Name: tickerBot
+Version: 0.1.0
+Summary: A stock trading bot with suggestion and automatic modes.
+Home-page: https://github.com/your-username/tickerBot
+Author: Your Name
+Author-email: your.email@example.com
+Description-Content-Type: text/markdown
+Requires-Dist: yfinance
+Requires-Dist: stocknews
+Requires-Dist: pandas
+Requires-Dist: get-all-tickers
+Requires-Dist: numpy
+Requires-Dist: requests
+Requires-Dist: multitasking
+Requires-Dist: platformdirs
+Requires-Dist: pytz
+Requires-Dist: frozendict
+Requires-Dist: peewee
+Requires-Dist: beautifulsoup4
+Requires-Dist: curl_cffi
+Requires-Dist: protobuf
+Requires-Dist: websockets
+Requires-Dist: feedparser
+Requires-Dist: nltk
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: summary
+
+# Ticker Bot
+
+A stock trading bot with suggestion and automatic modes.
+
+## Features
+
+- **Suggestion Mode**: Get trading suggestions for a stock based on technical indicators and news sentiment.
+- **Automatic Mode**: Run the bot in automatic trading mode with configurable parameters.
+- **Backtesting**: Backtest your trading strategies on historical data.
+
+## Installation
+
+```bash
+pip install .
+```
+
+## Usage
+
+```bash
+tickerbot suggestion AAPL
+tickerbot automatic --daily-limit 2000 --aggressiveness 0.7 --target-profit 150
+tickerbot backtest rsi AAPL
+```

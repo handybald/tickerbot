@@ -1,0 +1,17 @@
+yfinance
+stocknews
+pandas
+get-all-tickers
+numpy
+requests
+multitasking
+platformdirs
+pytz
+frozendict
+peewee
+beautifulsoup4
+curl_cffi
+protobuf
+websockets
+feedparser
+nltk
