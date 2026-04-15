@@ -30,6 +30,20 @@ NASDAQ100_TICKERS = [
     "TXN", "INTU", "HON", "AMAT", "BKNG", "GILD", "ADP", "SBUX", "VRTX", "MDLZ",
 ]
 
+# Forex / commodity currency pairs (yfinance format).
+# Each entry is a yfinance symbol that returns OHLCV data.
+FOREX_PAIRS = [
+    # Major pairs
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
+    "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
+    # Cross pairs
+    "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURCHF=X",
+    # Metals vs USD and EUR (popular with Turkish traders)
+    "XAUUSD=X", "XAGUSD=X", "XAUEUR=X",
+    # USD/TRY pair
+    "USDTRY=X", "EURTRY=X",
+]
+
 CACHE_PATH = Path("data/universe_cache.json")
 
 
@@ -80,7 +94,14 @@ def get_universe(scope: str, refresh_minutes: int = 720, force_sync: bool = Fals
         return load_or_sync_bist_universe(refresh_minutes=refresh_minutes, force_sync=force_sync)
     if normalized in {"NASDAQ", "US"}:
         return load_or_sync_us_universe(refresh_minutes=refresh_minutes, force_sync=force_sync)
+    if normalized == "FOREX":
+        return FOREX_PAIRS.copy()
     return BIST30_TICKERS.copy()
+
+
+def is_forex_ticker(ticker: str) -> bool:
+    """Returns True if the ticker is a forex/commodity pair (ends with =X or =F)."""
+    return ticker.endswith("=X") or ticker.endswith("=F")
 
 
 def load_or_sync_bist_universe(refresh_minutes: int = 720, force_sync: bool = False) -> list[str]:
@@ -284,6 +305,24 @@ def _cache_stale(cache: dict, refresh_minutes: int, key: str = "updated_at") -> 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def forex_volatility_ok(pair: str = "EURUSD=X", max_atr_pct: float = 0.015) -> dict:
+    """
+    Forex regime check: reject trading when intraday volatility (ATR%) is extreme.
+    Returns {"ok": True, "tradeable": bool, "atr_pct": float}.
+    """
+    from tickerbot.indicators import calculate_atr  # local import to avoid circular
+    data = fetch_history(CandleRequest(ticker=pair, period="30d", interval="1h"))
+    if data.empty or len(data) < 20:
+        return {"ok": False, "reason": "no_data"}
+    atr = calculate_atr(data)
+    if atr.empty or atr.isna().all():
+        return {"ok": False, "reason": "no_atr"}
+    price = float(data["Close"].iloc[-1])
+    atr_val = float(atr.iloc[-1])
+    atr_pct = atr_val / max(price, 1e-9)
+    return {"ok": True, "tradeable": atr_pct <= max_atr_pct, "atr_pct": atr_pct}
 
 
 def regime_snapshot(

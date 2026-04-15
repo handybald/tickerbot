@@ -46,6 +46,9 @@ class RuntimeSettings:
     flatten_minute_gmt3: int = 55
     no_data_fail_threshold: int = 3
     no_data_cooldown_minutes: int = 240
+    # Daily profit target: stop new entries once this gain is reached for the day.
+    daily_profit_target_enabled: bool = True
+    daily_profit_target_pct: float = 0.03   # 3 % default
 
 
 class SettingsStore:
@@ -77,7 +80,10 @@ class SettingsStore:
                 self.save(defaults)
                 return defaults
             payload = json.loads(row[0])
-            return RuntimeSettings(**payload)
+            # Field-filtered deserialization handles schema evolution safely.
+            known = {f for f in RuntimeSettings.__dataclass_fields__}
+            filtered = {k: v for k, v in payload.items() if k in known}
+            return RuntimeSettings(**filtered)
 
     def save(self, settings: RuntimeSettings) -> None:
         payload = json.dumps(asdict(settings))

@@ -16,6 +16,7 @@ from .market import (
     fetch_history,
     get_last_price,
     get_universe,
+    is_forex_ticker,
     regime_snapshot,
     sync_bist_universe,
     sync_us_universe,
@@ -52,6 +53,7 @@ class BotService:
         self._position_high_watermark: dict[str, float] = {}
         self._no_data_failures: dict[str, int] = {}
         self._no_data_block_until: dict[str, str] = {}
+        self._profit_halt_day: str = ""
 
         self._state_key = "runtime_state_v1"
         self._restore_runtime_state()
@@ -81,6 +83,13 @@ class BotService:
         now_local = datetime.now(self.istanbul_tz)
         settings = self.settings_store.load()
         self._apply_execution_settings(settings)
+
+        # Auto-clear profit halt when the calendar day rolls over.
+        today = now_local.strftime("%Y-%m-%d")
+        if self._profit_halt_day and self._profit_halt_day != today:
+            log.info("New trading day; profit halt cleared (was %s)", self._profit_halt_day)
+            self._profit_halt_day = ""
+            self._persist_runtime_state()
 
         self._maybe_send_daily_report(now_local, settings)
         self._maybe_send_weekly_report(now_local, settings)
@@ -197,6 +206,22 @@ class BotService:
             self._persist_runtime_state()
             return
 
+        # Daily profit target: stop new entries once gain threshold is reached.
+        if settings.daily_profit_target_enabled and not self._profit_halt_day:
+            daily_gain = (equity - day_start_equity) / max(day_start_equity, 1.0)
+            if daily_gain >= settings.daily_profit_target_pct:
+                self._profit_halt_day = day_key
+                self._persist_runtime_state()
+                log.info(
+                    "Profit target reached | gain=%.4f target=%.4f day=%s",
+                    daily_gain,
+                    settings.daily_profit_target_pct,
+                    day_key,
+                )
+                self.telegram.send_message(
+                    f"Daily profit target reached for {day_key}! Gain {daily_gain:.2%} >= {settings.daily_profit_target_pct:.2%}. No new entries until tomorrow."
+                )
+
         regime_ok = True
         if settings.regime_filter_enabled:
             regime_ticker = self._effective_regime_ticker(settings)
@@ -288,6 +313,8 @@ class BotService:
             if action == "BUY":
                 if not regime_ok:
                     continue
+                if self._profit_halt_day == day_key:
+                    continue
                 if has_position:
                     continue
                 if len(positions) >= settings.max_open_positions:
@@ -298,7 +325,7 @@ class BotService:
                     continue
                 if self._in_cooldown(ticker, settings, now_local):
                     continue
-                if not self._passes_liquidity_gate(data, settings):
+                if not self._passes_liquidity_gate(ticker, data, settings):
                     continue
 
                 trade_budget = self.broker.get_equity(latest_prices) * settings.per_trade_cash_pct
@@ -457,17 +484,24 @@ class BotService:
         if cmd in {"/help", "/start"}:
             return (
                 "Commands:\n"
-                "/status\n"
-                "/report\n"
-                "/weeklyreport\n"
-                "/debugsignals [n]\n"
-                "/positions\n"
-                "/settings\n"
-                "/set <key> <value>\n"
-                "/syncuniverse\n"
-                "/tradescsv [days]\n"
-                "/startbot\n"
-                "/stopbot"
+                "/status — equity, cash, open positions\n"
+                "/report — today's P&L report\n"
+                "/weeklyreport — weekly P&L summary\n"
+                "/signals [n] — top N signals from last cycle\n"
+                "/positions — open positions list\n"
+                "/settings — show all settings\n"
+                "/set <key> <value> — change a setting\n"
+                "  e.g. /set daily_profit_target_pct 0.03\n"
+                "  e.g. /set market_scope FOREX\n"
+                "/sync — sync ticker universe\n"
+                "/csv [days] — export trades CSV\n"
+                "/on — enable trading\n"
+                "/off — disable trading\n"
+                "\nKey settings:\n"
+                "  market_scope: BIST30 | BIST | NASDAQ | FOREX\n"
+                "  daily_profit_target_enabled / daily_profit_target_pct\n"
+                "  stop_loss_pct / take_profit_pct / trailing_stop_pct\n"
+                "  max_open_positions / min_signal_confidence"
             )
 
         if cmd == "/status":
@@ -502,17 +536,17 @@ class BotService:
             latest_prices = self._latest_position_prices()
             return format_weekly_report(datetime.now(self.istanbul_tz), self.trade_store, self.broker, latest_prices)
 
-        if cmd.startswith("/debugsignals"):
+        if cmd.startswith("/debugsignals") or cmd.startswith("/signals"):
             parts = cmd.split(maxsplit=1)
             limit = 10
             if len(parts) == 2:
                 try:
                     limit = max(1, int(parts[1]))
                 except ValueError:
-                    return "Usage: /debugsignals [n]"
+                    return "Usage: /signals [n]"
             return self._format_debug_signals(limit=limit)
 
-        if cmd == "/syncuniverse":
+        if cmd in {"/syncuniverse", "/sync"}:
             scope = settings.market_scope.upper().strip()
             if scope in {"NASDAQ", "US"}:
                 synced = sync_us_universe()
@@ -524,7 +558,7 @@ class BotService:
                 return "Universe sync failed; keeping cached/fallback universe."
             return f"Universe synced. {label} symbols cached: {len(synced)}"
 
-        if cmd.startswith("/tradescsv"):
+        if cmd.startswith("/tradescsv") or cmd.startswith("/csv"):
             parts = cmd.split(maxsplit=1)
             days = 7
             if len(parts) == 2:
@@ -540,12 +574,12 @@ class BotService:
             )
             return f"Sent CSV export for last {days} day(s)."
 
-        if cmd == "/startbot":
+        if cmd in {"/startbot", "/on"}:
             self.trading_enabled = True
             self._persist_runtime_state()
             return "Trading enabled."
 
-        if cmd == "/stopbot":
+        if cmd in {"/stopbot", "/off"}:
             self.trading_enabled = False
             self._persist_runtime_state()
             return "Trading disabled."
@@ -626,15 +660,21 @@ class BotService:
                 base -= 0.05
         return max(0.30, min(0.80, base))
 
-    def _passes_liquidity_gate(self, data, settings: RuntimeSettings) -> bool:
+    def _passes_liquidity_gate(self, ticker: str, data, settings: RuntimeSettings) -> bool:
         if data.empty or len(data) < 20:
             return False
+        # Forex / commodity pairs have no meaningful volume — skip the gate.
+        if is_forex_ticker(ticker):
+            return True
         if "Volume" not in data.columns:
             return True
         avg_volume = float(data["Volume"].tail(20).mean())
         price = float(data["Close"].iloc[-1])
         turnover = avg_volume * price
-        return avg_volume >= settings.min_avg_volume and turnover >= settings.min_turnover_try
+        # TRY turnover check only applies to BIST (.IS) tickers.
+        if ticker.endswith(".IS"):
+            return avg_volume >= settings.min_avg_volume and turnover >= settings.min_turnover_try
+        return avg_volume >= settings.min_avg_volume
 
     def _exit_reason(self, pos, price: float, now_local: datetime, settings: RuntimeSettings) -> str:
         if not pos:
@@ -764,6 +804,7 @@ class BotService:
             "selected_strategy": self.selected_strategy,
             "selected_timeframe": self.selected_timeframe,
             "trading_enabled": self.trading_enabled,
+            "profit_halt_day": self._profit_halt_day,
             "last_signal_time": self._last_signal_time.isoformat() if self._last_signal_time else "",
             "position_high_watermark": self._position_high_watermark,
             "no_data_failures": self._no_data_failures,
@@ -775,6 +816,8 @@ class BotService:
     @staticmethod
     def _effective_regime_ticker(settings: RuntimeSettings) -> str:
         scope = settings.market_scope.upper().strip()
+        if scope == "FOREX" and settings.regime_ticker == "XU100.IS":
+            return "DX-Y.NYB"
         if scope in {"NASDAQ", "US"} and settings.regime_ticker == "XU100.IS":
             return "QQQ"
         return settings.regime_ticker
@@ -794,6 +837,7 @@ class BotService:
         self.selected_strategy = str(payload.get("selected_strategy", self.selected_strategy))
         self.selected_timeframe = str(payload.get("selected_timeframe", self.selected_timeframe))
         self.trading_enabled = bool(payload.get("trading_enabled", self.trading_enabled))
+        self._profit_halt_day = str(payload.get("profit_halt_day", ""))
 
         last_signal_time = payload.get("last_signal_time")
         if isinstance(last_signal_time, str) and last_signal_time:
