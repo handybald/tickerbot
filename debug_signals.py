@@ -46,7 +46,15 @@ def _flag(cond: bool, true_label: str = "YES", false_label: str = "NO") -> str:
     return true_label if cond else false_label
 
 
-def analyze(ticker: str, timeframe: str, strategy: str) -> None:
+def _fetch_sentiment(ticker: str) -> float:
+    try:
+        from tickerbot.data_fetcher import DataFetcher
+        return DataFetcher(ticker).get_sentiment()
+    except Exception:
+        return 0.0
+
+
+def analyze(ticker: str, timeframe: str, strategy: str, sentiment: float = 0.0) -> None:
     cfg = TIMEFRAME_CONFIG.get(timeframe)
     if not cfg:
         print(f"Unknown timeframe {timeframe!r}. Choose from: {list(TIMEFRAME_CONFIG)}")
@@ -175,6 +183,19 @@ def analyze(ticker: str, timeframe: str, strategy: str) -> None:
         except Exception:
             pass
 
+    # ── News sentiment ────────────────────────────────────────────────────
+    sent_label = (
+        "BULLISH tilt" if sentiment > 0.25
+        else "BEARISH tilt" if sentiment < -0.25
+        else "neutral / no news"
+    )
+    sent_contrib = 0.0
+    if sentiment > 0.25:
+        sent_contrib = min(0.5, sentiment * 0.8)
+    elif sentiment < -0.25:
+        sent_contrib = max(-0.5, sentiment * 0.8)
+    print(f"  News sentiment: {sentiment:+.3f}  [{sent_label}]  score contribution={sent_contrib:+.3f}")
+
     # ── Strategy decision ─────────────────────────────────────────────────
     print(f"\n  {_BAR[2:]}")
     print(f"  Strategy scoring  ({strategy})")
@@ -193,6 +214,7 @@ def analyze(ticker: str, timeframe: str, strategy: str) -> None:
         di_trend_bullish=di_trend_bullish,
         wr=wr_val,
         stoch_k=stoch_k_val,
+        sentiment=sentiment,
     )
     confidence = min(abs(raw) / 3.5, 1.0) - atr_penalty
     confidence = max(0.0, confidence)
@@ -210,6 +232,8 @@ def analyze(ticker: str, timeframe: str, strategy: str) -> None:
 
     # Score breakdown
     print(f"\n  Contributing factors:")
+    if sent_contrib != 0.0:
+        print(f"  • Sentiment {sentiment:+.3f} → {sent_contrib:+.3f}")
     if strategy == "momentum":
         if not is_trending:
             print("  ✗ ADX < 20 — market not trending, score zeroed")
@@ -258,13 +282,24 @@ def main() -> None:
         default="all",
         help="Strategy to score (default: all three)",
     )
+    parser.add_argument(
+        "--no-sentiment", action="store_true",
+        help="Skip news sentiment fetch (faster, offline-safe)",
+    )
     args = parser.parse_args()
 
     strategies = ["balanced", "momentum", "mean_reversion"] if args.strategy == "all" else [args.strategy]
 
     for ticker in args.tickers:
+        # Fetch sentiment once per ticker, share across all three strategy runs
+        if args.no_sentiment:
+            sent = 0.0
+        else:
+            print(f"  Fetching news sentiment for {ticker} …", end=" ", flush=True)
+            sent = _fetch_sentiment(ticker)
+            print(f"{sent:+.3f}")
         for strat in strategies:
-            analyze(ticker, args.timeframe, strat)
+            analyze(ticker, args.timeframe, strat, sentiment=sent)
 
 
 if __name__ == "__main__":

@@ -68,11 +68,13 @@ class StrategyManager:
         strategy: str,
         timeframe: str,
         data: pd.DataFrame,
+        sentiment: float = 0.0,
     ) -> tuple[str, float]:
         """Return (action, confidence) for a single bar series.
 
         action    : "BUY" | "SELL" | "HOLD"
         confidence: [0, 1]
+        sentiment : [-1, 1] news sentiment score; 0 = neutral / unavailable
         """
         if data.empty or len(data) < 50:
             return "HOLD", 0.0
@@ -146,6 +148,7 @@ class StrategyManager:
             di_trend_bullish=di_trend_bullish,
             wr=wr_val,
             stoch_k=stoch_k_val,
+            sentiment=sentiment,
         )
 
         confidence = min(abs(score) / 3.5, 1.0) - atr_penalty
@@ -170,6 +173,7 @@ class StrategyManager:
         di_trend_bullish: bool,
         wr: float,
         stoch_k: float,
+        sentiment: float = 0.0,
     ) -> float:
         score = 0.0
 
@@ -241,6 +245,14 @@ class StrategyManager:
                 score += 0.4
             elif wr > -25:
                 score -= 0.4
+
+        # News sentiment adjustment — small additive tilt, never the primary driver.
+        # Only fires when sentiment is clearly positive (>0.25) or negative (<-0.25).
+        # Capped at ±0.5 so it can tip a borderline signal but cannot create one alone.
+        if sentiment > 0.25:
+            score += min(0.5, sentiment * 0.8)
+        elif sentiment < -0.25:
+            score += max(-0.5, sentiment * 0.8)
 
         return score
 

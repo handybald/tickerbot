@@ -54,6 +54,9 @@ class BotService:
         self._no_data_failures: dict[str, int] = {}
         self._no_data_block_until: dict[str, str] = {}
         self._profit_halt_day: str = ""
+        # sentiment cache: ticker → (score, fetched_at_unix_ts)
+        self._sentiment_cache: dict[str, tuple[float, float]] = {}
+        self._sentiment_ttl: float = 4 * 3600.0   # refresh every 4 hours
 
         self._state_key = "runtime_state_v1"
         self._restore_runtime_state()
@@ -254,7 +257,10 @@ class BotService:
         exits_by_rule = 0
 
         for ticker, data in live_data.items():
-            action, confidence = self.strategy_manager.signal(self.selected_strategy, self.selected_timeframe, data)
+            sentiment = self._get_sentiment(ticker)
+            action, confidence = self.strategy_manager.signal(
+                self.selected_strategy, self.selected_timeframe, data, sentiment=sentiment
+            )
             price = float(latest_prices[ticker])
             positions = self.broker.get_positions()
             pos = positions.get(ticker)
@@ -302,6 +308,7 @@ class BotService:
                     "action": action,
                     "confidence": float(confidence),
                     "price": price,
+                    "sentiment": round(sentiment, 3),
                 }
             )
             if action == "HOLD" or confidence < dynamic_min_conf:
@@ -707,6 +714,20 @@ class BotService:
         ]
         return "\n".join(lines)
 
+    def _get_sentiment(self, ticker: str) -> float:
+        """Return cached news sentiment for ticker, refreshing if stale."""
+        now_ts = time.time()
+        cached = self._sentiment_cache.get(ticker)
+        if cached and (now_ts - cached[1]) < self._sentiment_ttl:
+            return cached[0]
+        try:
+            from tickerbot.data_fetcher import DataFetcher
+            score = DataFetcher(ticker).get_sentiment()
+        except Exception:
+            score = 0.0
+        self._sentiment_cache[ticker] = (score, now_ts)
+        return score
+
     def _latest_position_prices(self) -> dict[str, float]:
         latest_prices = {}
         for ticker in self.broker.get_positions().keys():
@@ -732,8 +753,10 @@ class BotService:
             f"Top {len(top)} by confidence:",
         ]
         for row in top:
+            sent = row.get("sentiment", 0.0)
+            sent_str = f" sent={sent:+.2f}" if sent != 0.0 else ""
             lines.append(
-                f"- {row['ticker']} {row['action']} conf={row['confidence']:.2f} price={row['price']:.2f}"
+                f"- {row['ticker']} {row['action']} conf={row['confidence']:.2f} price={row['price']:.2f}{sent_str}"
             )
         return "\n".join(lines)
 
