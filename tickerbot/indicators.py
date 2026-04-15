@@ -142,6 +142,33 @@ def calculate_williams_r(data, window=14):
     return wr
 
 
+def calculate_obv(data):
+    """
+    On-Balance Volume — running cumulative volume.
+    Adds volume on up-close days, subtracts on down-close days.
+    OBV rising = volume supports the price trend (confirmation).
+    OBV diverging from price = weakening trend (warning).
+    Requires 'Close' and 'Volume' columns.
+    """
+    if not {"Close", "Volume"}.issubset(data.columns):
+        return pd.Series(dtype=float, index=data.index)
+    direction = np.sign(data["Close"].diff()).fillna(0)
+    obv = (direction * data["Volume"]).cumsum()
+    return obv
+
+
+def calculate_volume_ratio(data, window: int = 20) -> pd.Series:
+    """
+    Current bar volume relative to the rolling average.
+    > 1.5 = above-average activity (confirms signal direction).
+    < 0.5 = below-average activity (signal less reliable).
+    """
+    if "Volume" not in data.columns:
+        return pd.Series(1.0, index=data.index)
+    avg = data["Volume"].rolling(window=window).mean().replace(0, np.nan)
+    return data["Volume"] / avg
+
+
 def calculate_vwap(data):
     """
     Volume Weighted Average Price.

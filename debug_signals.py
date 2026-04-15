@@ -1,49 +1,50 @@
 #!/usr/bin/env python3
 """
-debug_signals.py — inspect indicator values and strategy decision for any ticker.
+debug_signals.py — inspect indicator values, volume, macro context,
+                   and multi-timeframe decision for any ticker.
 
 Usage:
-    python debug_signals.py TICKER [TICKER2 ...] [--timeframe 15m|1h|1d] [--strategy balanced|momentum|mean_reversion]
-
-Examples:
+    python debug_signals.py TICKER [TICKER2 ...] [--strategy balanced|momentum|mean_reversion|all]
     python debug_signals.py GARAN.IS
-    python debug_signals.py EURUSD=X --timeframe 1h
-    python debug_signals.py AAPL MSFT --strategy momentum
+    python debug_signals.py AVGO --strategy momentum
+    python debug_signals.py EURUSD=X --no-sentiment
 """
 from __future__ import annotations
 
 import argparse
-import sys
 
 import pandas as pd
 
+from tickerbot.core.macro_sentiment import get_macro_sentiment
 from tickerbot.core.market import CandleRequest, fetch_history
-from tickerbot.core.strategy import StrategyManager, TIMEFRAME_CONFIG, _ADX_TREND_THRESHOLD, _MAX_ATR_PCT
+from tickerbot.core.strategy import (
+    StrategyManager,
+    TIMEFRAME_CONFIG,
+    _ADX_TREND_THRESHOLD,
+    _MAX_ATR_PCT,
+)
 from tickerbot.indicators import (
     calculate_adx,
     calculate_atr,
     calculate_bollinger_bands,
     calculate_macd,
+    calculate_obv,
     calculate_rsi,
     calculate_sma,
     calculate_stochastic,
+    calculate_volume_ratio,
     calculate_vwap,
     calculate_williams_r,
 )
 
-_BAR = "─" * 56
+_BAR = "─" * 60
 
 
-def _val(series: pd.Series, fmt: str = ".4f") -> str:
+def _v(series: pd.Series, fmt: str = ".4f") -> str:
     try:
-        v = float(series.dropna().iloc[-1])
-        return format(v, fmt)
+        return format(float(series.dropna().iloc[-1]), fmt)
     except Exception:
         return "n/a"
-
-
-def _flag(cond: bool, true_label: str = "YES", false_label: str = "NO") -> str:
-    return true_label if cond else false_label
 
 
 def _fetch_sentiment(ticker: str) -> float:
@@ -54,90 +55,90 @@ def _fetch_sentiment(ticker: str) -> float:
         return 0.0
 
 
-def analyze(ticker: str, timeframe: str, strategy: str, sentiment: float = 0.0) -> None:
-    cfg = TIMEFRAME_CONFIG.get(timeframe)
-    if not cfg:
-        print(f"Unknown timeframe {timeframe!r}. Choose from: {list(TIMEFRAME_CONFIG)}")
+def _fetch_macro(scope: str) -> dict[str, float]:
+    try:
+        return get_macro_sentiment(scope)
+    except Exception:
+        return {"global": 0.0, "market": 0.0}
+
+
+def analyze_ticker(
+    ticker: str,
+    strategy: str,
+    ticker_sentiment: float,
+    macro: dict[str, float],
+    data_by_tf: dict[str, pd.DataFrame],
+) -> None:
+    """Print full indicator + MTF breakdown for one ticker / strategy combo."""
+    macro_net = macro.get("global", 0.0) * 0.4 + macro.get("market", 0.0) * 0.6
+    combined_sent = ticker_sentiment * 0.6 + macro_net * 0.4
+
+    # Use selected analysis TF (default 1h) for indicator display
+    for tf_pref in ("1h", "1d", "15m"):
+        if tf_pref in data_by_tf:
+            display_tf = tf_pref
+            break
+    else:
+        print(f"  No data available for {ticker}")
         return
 
-    period, interval = cfg
-    print(f"\n{_BAR}")
-    print(f"  {ticker}  |  timeframe={timeframe}  |  strategy={strategy}")
-    print(_BAR)
-    print(f"  Fetching {period} of {interval} data …")
-
-    data = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
-    if data.empty:
-        print("  ERROR: no data returned — check ticker symbol or internet connection")
-        return
-
-    print(f"  Bars loaded : {len(data)}  ({data.index[0].date()} → {data.index[-1].date()})")
+    data = data_by_tf[display_tf]
     price = float(data["Close"].iloc[-1])
+
+    print(f"\n{_BAR}")
+    print(f"  {ticker}  |  strategy={strategy}")
+    print(f"  Bars: {display_tf}={len(data)}" +
+          "".join(f"  {tf}={len(data_by_tf[tf])}" for tf in ("15m", "1d") if tf in data_by_tf))
+    print(_BAR)
     print(f"  Last close  : {price:.4f}")
 
-    # ── Moving averages ────────────────────────────────────────────────────
-    sma20  = _val(calculate_sma(data, 20))
-    sma50  = _val(calculate_sma(data, 50))
-    sma200 = _val(calculate_sma(data, 200))
-    print(f"\n  SMA(20)={sma20}  SMA(50)={sma50}  SMA(200)={sma200}")
+    # ── Moving Averages ───────────────────────────────────────────────────
+    print(f"  SMA(20/50/200): {_v(calculate_sma(data, 20))} / {_v(calculate_sma(data, 50))} / {_v(calculate_sma(data, 200))}")
 
     # ── RSI ───────────────────────────────────────────────────────────────
     rsi = calculate_rsi(data)
     rsi_val = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else 50.0
-    rsi_label = (
-        "OVERSOLD ← BUY signal" if rsi_val < 30
-        else "OVERBOUGHT ← SELL signal" if rsi_val > 70
-        else "neutral"
-    )
-    print(f"\n  RSI(14)     : {rsi_val:.2f}  [{rsi_label}]")
+    rsi_lbl = "OVERSOLD" if rsi_val < 30 else ("OVERBOUGHT" if rsi_val > 70 else "neutral")
+    print(f"  RSI(14)       : {rsi_val:.2f}  [{rsi_lbl}]")
 
     # ── MACD ──────────────────────────────────────────────────────────────
     macd, sig_line = calculate_macd(data)
-    macd_last = float(macd.dropna().iloc[-1]) if not macd.dropna().empty else 0.0
-    sig_last  = float(sig_line.dropna().iloc[-1]) if not sig_line.dropna().empty else 0.0
-    cross = macd_last - sig_last
-    cross_label = "BULLISH (MACD above signal)" if cross > 0 else "BEARISH (MACD below signal)"
-    print(f"  MACD        : {macd_last:.4f}  Signal={sig_last:.4f}  Cross={cross:+.4f}  [{cross_label}]")
+    cross = (float(macd.dropna().iloc[-1]) if not macd.dropna().empty else 0.0) - \
+            (float(sig_line.dropna().iloc[-1]) if not sig_line.dropna().empty else 0.0)
+    print(f"  MACD cross    : {cross:+.4f}  [{'BULLISH' if cross > 0 else 'BEARISH'}]")
 
     # ── Bollinger Bands ───────────────────────────────────────────────────
     upper_bb, lower_bb = calculate_bollinger_bands(data)
     upper_val = float(upper_bb.dropna().iloc[-1]) if not upper_bb.dropna().empty else price * 1.05
     lower_val = float(lower_bb.dropna().iloc[-1]) if not lower_bb.dropna().empty else price * 0.95
-    bb_pos = (
-        "ABOVE upper band ← overbought" if price > upper_val
-        else "BELOW lower band ← oversold" if price < lower_val
-        else "inside bands"
-    )
-    print(f"  BB(20,2)    : lower={lower_val:.4f}  price={price:.4f}  upper={upper_val:.4f}  [{bb_pos}]")
+    bb_pos = ("ABOVE upper" if price > upper_val else "BELOW lower" if price < lower_val else "inside")
+    print(f"  BB(20,2)      : {bb_pos}  lo={lower_val:.4f}  price={price:.4f}  hi={upper_val:.4f}")
 
     # ── ATR ───────────────────────────────────────────────────────────────
     atr = calculate_atr(data)
+    atr_penalty = 0.0
     if not atr.dropna().empty and price > 0:
-        atr_val = float(atr.dropna().iloc[-1])
-        atr_pct = atr_val / price
+        atr_pct = float(atr.dropna().iloc[-1]) / price
         atr_penalty = min(0.25, (atr_pct - _MAX_ATR_PCT) / _MAX_ATR_PCT * 0.25) if atr_pct > _MAX_ATR_PCT else 0.0
-        atr_note = f"penalty={atr_penalty:.2f}" if atr_penalty > 0 else "within normal range"
-        print(f"  ATR(14)     : {atr_val:.4f}  ({atr_pct*100:.2f}% of price)  [{atr_note}]")
+        print(f"  ATR(14)       : {float(atr.dropna().iloc[-1]):.4f}  ({atr_pct*100:.2f}% of price)  "
+              f"[penalty={atr_penalty:.2f}]")
     else:
-        atr_val = 0.0
-        atr_penalty = 0.0
-        print("  ATR(14)     : n/a")
+        print("  ATR(14)       : n/a")
 
     # ── ADX ───────────────────────────────────────────────────────────────
-    adx_val = 25.0
-    di_trend_bullish = True
+    adx_val, di_trend_bullish = 25.0, True
     try:
-        adx_series, di_plus, di_minus = calculate_adx(data)
-        if not adx_series.dropna().empty:
-            adx_val = float(adx_series.dropna().iloc[-1])
-            dip = float(di_plus.dropna().iloc[-1])
-            dim = float(di_minus.dropna().iloc[-1])
+        adx_s, dip_s, dim_s = calculate_adx(data)
+        if not adx_s.dropna().empty:
+            adx_val = float(adx_s.dropna().iloc[-1])
+            dip = float(dip_s.dropna().iloc[-1])
+            dim = float(dim_s.dropna().iloc[-1])
             di_trend_bullish = dip > dim
-            trend_str = "TRENDING" if adx_val >= _ADX_TREND_THRESHOLD else "RANGING/SIDEWAYS"
-            dir_str = f"DI+={dip:.1f} > DI-={dim:.1f} → BULLISH" if di_trend_bullish else f"DI+={dip:.1f} < DI-={dim:.1f} → BEARISH"
-            print(f"  ADX(14)     : {adx_val:.2f}  [{trend_str}]  {dir_str}")
-    except Exception as exc:
-        print(f"  ADX(14)     : error ({exc})")
+            t_lbl = "TRENDING" if adx_val >= _ADX_TREND_THRESHOLD else "RANGING"
+            d_lbl = f"DI+={dip:.1f}>DI-={dim:.1f} BULL" if di_trend_bullish else f"DI-={dim:.1f}>DI+={dip:.1f} BEAR"
+            print(f"  ADX(14)       : {adx_val:.2f}  [{t_lbl}]  {d_lbl}")
+    except Exception:
+        pass
 
     is_trending = adx_val >= _ADX_TREND_THRESHOLD
 
@@ -147,61 +148,104 @@ def analyze(ticker: str, timeframe: str, strategy: str, sentiment: float = 0.0) 
         wr = calculate_williams_r(data)
         if not wr.dropna().empty:
             wr_val = float(wr.dropna().iloc[-1])
-            wr_label = (
-                "OVERBOUGHT (>-20)" if wr_val > -20
-                else "OVERSOLD (<-80)" if wr_val < -80
-                else "neutral"
-            )
-            print(f"  Williams %R : {wr_val:.2f}  [{wr_label}]")
-    except Exception as exc:
-        print(f"  Williams %R : error ({exc})")
+            wr_lbl = "OVERBOUGHT" if wr_val > -20 else ("OVERSOLD" if wr_val < -80 else "neutral")
+            print(f"  Williams %R   : {wr_val:.2f}  [{wr_lbl}]")
+    except Exception:
+        pass
 
     # ── Stochastic ────────────────────────────────────────────────────────
     stoch_k_val = 50.0
     try:
-        stoch_k, stoch_d = calculate_stochastic(data)
-        if not stoch_k.dropna().empty:
-            stoch_k_val = float(stoch_k.dropna().iloc[-1])
-            stoch_d_val = float(stoch_d.dropna().iloc[-1]) if not stoch_d.dropna().empty else stoch_k_val
-            stoch_label = (
-                "OVERBOUGHT (>80)" if stoch_k_val > 80
-                else "OVERSOLD (<20)" if stoch_k_val < 20
-                else "neutral"
-            )
-            print(f"  Stoch %K/%D : K={stoch_k_val:.2f}  D={stoch_d_val:.2f}  [{stoch_label}]")
-    except Exception as exc:
-        print(f"  Stoch %K/%D : error ({exc})")
+        sk, sd = calculate_stochastic(data)
+        if not sk.dropna().empty:
+            stoch_k_val = float(sk.dropna().iloc[-1])
+            sd_val = float(sd.dropna().iloc[-1]) if not sd.dropna().empty else stoch_k_val
+            s_lbl = "OVERBOUGHT" if stoch_k_val > 80 else ("OVERSOLD" if stoch_k_val < 20 else "neutral")
+            print(f"  Stoch %K/%D   : K={stoch_k_val:.2f}  D={sd_val:.2f}  [{s_lbl}]")
+    except Exception:
+        pass
 
-    # ── VWAP (only meaningful for intraday) ───────────────────────────────
-    if timeframe in ("15m", "1h"):
+    # ── VWAP (intraday only) ──────────────────────────────────────────────
+    if display_tf in ("15m", "1h"):
         try:
             vwap = calculate_vwap(data)
             if not vwap.dropna().empty:
-                vwap_val = float(vwap.dropna().iloc[-1])
-                vwap_label = "price ABOVE vwap ← bullish bias" if price > vwap_val else "price BELOW vwap ← bearish bias"
-                print(f"  VWAP        : {vwap_val:.4f}  [{vwap_label}]")
+                vv = float(vwap.dropna().iloc[-1])
+                print(f"  VWAP          : {vv:.4f}  [price {'ABOVE' if price > vv else 'BELOW'} vwap]")
         except Exception:
             pass
 
-    # ── News sentiment ────────────────────────────────────────────────────
-    sent_label = (
-        "BULLISH tilt" if sentiment > 0.25
-        else "BEARISH tilt" if sentiment < -0.25
-        else "neutral / no news"
-    )
-    sent_contrib = 0.0
-    if sentiment > 0.25:
-        sent_contrib = min(0.5, sentiment * 0.8)
-    elif sentiment < -0.25:
-        sent_contrib = max(-0.5, sentiment * 0.8)
-    print(f"  News sentiment: {sentiment:+.3f}  [{sent_label}]  score contribution={sent_contrib:+.3f}")
+    # ── OBV (On-Balance Volume) ───────────────────────────────────────────
+    print()
+    obv_rising = None
+    try:
+        obv = calculate_obv(data)
+        if not obv.dropna().empty and len(obv.dropna()) >= 20:
+            obv_sma = obv.rolling(20).mean()
+            obv_rising = float(obv.iloc[-1]) > float(obv_sma.dropna().iloc[-1])
+            lbl = "OBV RISING ↑ — volume confirms up move" if obv_rising else "OBV FALLING ↓ — volume confirms down move"
+            print(f"  OBV trend     : {lbl}")
+    except Exception:
+        pass
 
-    # ── Strategy decision ─────────────────────────────────────────────────
-    print(f"\n  {_BAR[2:]}")
-    print(f"  Strategy scoring  ({strategy})")
-    print(f"  {_BAR[2:]}")
+    # ── Volume Ratio ──────────────────────────────────────────────────────
+    vol_ratio_val = None
+    try:
+        vr = calculate_volume_ratio(data)
+        if not vr.dropna().empty:
+            vol_ratio_val = float(vr.dropna().iloc[-1])
+            if vol_ratio_val > 2.0:
+                vr_lbl = f"VERY HIGH ({vol_ratio_val:.2f}x avg) — strong confirmation"
+            elif vol_ratio_val > 1.5:
+                vr_lbl = f"HIGH ({vol_ratio_val:.2f}x avg) — above-average activity"
+            elif vol_ratio_val < 0.5:
+                vr_lbl = f"LOW ({vol_ratio_val:.2f}x avg) — signal less reliable"
+            else:
+                vr_lbl = f"normal ({vol_ratio_val:.2f}x avg)"
+            print(f"  Volume ratio  : {vr_lbl}")
+    except Exception:
+        pass
+
+    # ── News & Macro Sentiment ────────────────────────────────────────────
+    print()
+    ts_lbl = "BULLISH" if ticker_sentiment > 0.25 else ("BEARISH" if ticker_sentiment < -0.25 else "neutral")
+    ms_lbl = "BULLISH" if macro_net > 0.15 else ("BEARISH" if macro_net < -0.15 else "neutral")
+    print(f"  Ticker news   : {ticker_sentiment:+.3f}  [{ts_lbl}]")
+    print(f"  Macro global  : {macro.get('global', 0.0):+.3f}   Market: {macro.get('market', 0.0):+.3f}   Net: {macro_net:+.3f}  [{ms_lbl}]")
+    print(f"  Combined sent : {combined_sent:+.3f}  (ticker×0.6 + macro×0.4)")
+
+    # ── Multi-Timeframe Analysis ──────────────────────────────────────────
+    print(f"\n  {'─'*54}")
+    print(f"  Multi-Timeframe Analysis  ({strategy})")
+    print(f"  {'─'*54}")
 
     manager = StrategyManager()
+    mtf = manager.mtf_signal(
+        strategy=strategy,
+        data_by_tf=data_by_tf,
+        ticker_sentiment=ticker_sentiment,
+        macro_sentiment=macro_net,
+    )
+
+    tf_labels = {"1d": "trend frame", "1h": "setup frame", "15m": "entry frame"}
+    for tf_key in ("1d", "1h", "15m"):
+        if tf_key in mtf.breakdown:
+            s = mtf.breakdown[tf_key]
+            lbl = tf_labels.get(tf_key, "")
+            bar = "▓" * int(s["confidence"] * 10)
+            print(f"  {tf_key} ({lbl:<12}): {s['action']:4s}  conf={s['confidence']:.2f}  {bar}")
+
+    align_str = f"{mtf.alignment}/{mtf.total_tfs} timeframes agree"
+    if mtf.alignment == mtf.total_tfs and mtf.total_tfs > 1:
+        align_str += "  ← FULL ALIGNMENT"
+    elif mtf.action == "HOLD" and mtf.total_tfs > 1:
+        align_str += "  ← BLOCKED (timeframes conflict)"
+
+    print(f"\n  Alignment     : {align_str}")
+    print(f"\n  >>> MTF DECISION: {mtf.action}  (conf={mtf.confidence:.2f}) <<<")
+
+    # ── Single-TF score breakdown for reference ───────────────────────────
+    print(f"\n  Single-TF score breakdown ({display_tf}):")
     raw = manager._raw_score(
         strategy=strategy,
         price=price,
@@ -214,92 +258,100 @@ def analyze(ticker: str, timeframe: str, strategy: str, sentiment: float = 0.0) 
         di_trend_bullish=di_trend_bullish,
         wr=wr_val,
         stoch_k=stoch_k_val,
-        sentiment=sentiment,
+        sentiment=combined_sent,
     )
-    confidence = min(abs(raw) / 3.5, 1.0) - atr_penalty
-    confidence = max(0.0, confidence)
-
-    if raw >= 1.3:
-        action = "BUY"
-    elif raw <= -1.3:
-        action = "SELL"
-    else:
-        action = "HOLD"
-
-    print(f"  Raw score   : {raw:+.4f}  (threshold ±1.3)")
-    print(f"  Confidence  : {confidence:.4f}  (ATR penalty={atr_penalty:.4f})")
-    print(f"\n  >>> DECISION: {action}  (conf={confidence:.2f}) <<<")
-
-    # Score breakdown
-    print(f"\n  Contributing factors:")
-    if sent_contrib != 0.0:
-        print(f"  • Sentiment {sentiment:+.3f} → {sent_contrib:+.3f}")
+    print(f"  Raw score: {raw:+.4f}  (threshold ±1.3)")
     if strategy == "momentum":
         if not is_trending:
-            print("  ✗ ADX < 20 — market not trending, score zeroed")
+            print("  ✗ ADX<20 — not trending, score zeroed")
         else:
-            print(f"  • MACD cross {cross:+.4f} → {'  +1.5' if cross > 0 else '  -1.0'}")
-            print(f"  • RSI {rsi_val:.1f} {'> 55 → +0.8' if rsi_val > 55 else '(no boost)'}")
-            if rsi_val > 78: print(f"  • RSI {rsi_val:.1f} > 78 → -0.7 (overbought)")
-            print(f"  • Williams %R {wr_val:.1f} → {'+0.4 (near overbought, momentum)' if wr_val > -30 else '-0.4 (losing steam)' if wr_val < -70 else 'no signal'}")
-            print(f"  • DI direction+MACD → {'+0.5 (aligned bullish)' if di_trend_bullish and cross > 0 else '-0.5 (aligned bearish)' if not di_trend_bullish and cross < 0 else 'mixed'}")
-            print(f"  • Stoch %K {stoch_k_val:.1f} → {'+0.3' if stoch_k_val > 60 else 'no signal'}{' -0.3 (short-term top)' if stoch_k_val > 85 else ''}")
+            print(f"  • MACD {cross:+.4f} → {'  +1.5' if cross > 0 else '  -1.0'}")
+            print(f"  • RSI {rsi_val:.1f} → {'+0.8 (>55)' if rsi_val > 55 else 'no boost'}{' -0.7 (>78)' if rsi_val > 78 else ''}")
+            print(f"  • Williams %R {wr_val:.1f} → {'+0.4' if wr_val > -30 else '-0.4 (losing steam)' if wr_val < -70 else 'no signal'}")
+            print(f"  • DI align → {'+0.5' if di_trend_bullish and cross > 0 else '-0.5' if not di_trend_bullish and cross < 0 else 'mixed'}")
+            print(f"  • Stoch {stoch_k_val:.1f} → {'+0.3' if stoch_k_val > 60 else 'no signal'}{' -0.3 (top)' if stoch_k_val > 85 else ''}")
     elif strategy == "mean_reversion":
         if is_trending and adx_val > 35:
-            print("  ✗ ADX > 35 in strong trend — mean reversion blocked")
+            print("  ✗ ADX>35 strong trend — mean reversion blocked")
         else:
-            bb_note = "+1.5 (price below lower band)" if price < lower_val else "-1.5 (price above upper band)" if price > upper_val else "0 (inside bands)"
-            print(f"  • Bollinger Bands → {bb_note}")
-            print(f"  • RSI {rsi_val:.1f} → {'  +1.0 (oversold)' if rsi_val < 30 else '-1.0 (overbought)' if rsi_val > 70 else 'no signal'}")
-            print(f"  • Williams %R {wr_val:.1f} → {'+0.8 (oversold)' if wr_val < -80 else '-0.8 (overbought)' if wr_val > -20 else 'no signal'}")
-            print(f"  • Stoch %K {stoch_k_val:.1f} → {'+0.5 (oversold)' if stoch_k_val < 20 else '-0.5 (overbought)' if stoch_k_val > 80 else 'no signal'}")
+            bb_c = "+1.5 (below lower)" if price < lower_val else "-1.5 (above upper)" if price > upper_val else "0 (inside)"
+            print(f"  • BB → {bb_c}")
+            print(f"  • RSI {rsi_val:.1f} → {'+1.0 (<30)' if rsi_val < 30 else '-1.0 (>70)' if rsi_val > 70 else 'no signal'}")
+            print(f"  • Williams %R {wr_val:.1f} → {'+0.8 (<-80)' if wr_val < -80 else '-0.8 (>-20)' if wr_val > -20 else 'no signal'}")
+            print(f"  • Stoch {stoch_k_val:.1f} → {'+0.5 (<20)' if stoch_k_val < 20 else '-0.5 (>80)' if stoch_k_val > 80 else 'no signal'}")
     else:  # balanced
-        print(f"  • MACD cross {cross:+.4f} → {'  +1.0' if cross > 0 else '  -1.0'}")
-        print(f"  • RSI {rsi_val:.1f} → {'  +1.0 (oversold <35)' if rsi_val < 35 else '-1.0 (overbought >70)' if rsi_val > 70 else 'no signal'}")
-        bb_note = "+0.7 (below lower)" if price < lower_val else "-0.7 (above upper)" if price > upper_val else "0 (inside)"
-        print(f"  • Bollinger Bands → {bb_note}")
+        print(f"  • MACD {cross:+.4f} → {'  +1.0' if cross > 0 else '  -1.0'}")
+        print(f"  • RSI {rsi_val:.1f} → {'+1.0 (<35)' if rsi_val < 35 else '-1.0 (>70)' if rsi_val > 70 else 'no signal'}")
+        print(f"  • BB → {'+0.7 (below lower)' if price < lower_val else '-0.7 (above upper)' if price > upper_val else '0 (inside)'}")
         if is_trending:
-            print(f"  • ADX trend boost → {'+0.4 (bullish aligned)' if cross > 0 and di_trend_bullish else '-0.4 (bearish aligned)' if cross < 0 and not di_trend_bullish else '0 (mixed)'}")
-        print(f"  • Williams %R {wr_val:.1f} → {'+0.4 (oversold <-75)' if wr_val < -75 else '-0.4 (overbought >-25)' if wr_val > -25 else 'no signal'}")
-
+            print(f"  • ADX boost → {'+0.4' if cross > 0 and di_trend_bullish else '-0.4' if cross < 0 and not di_trend_bullish else '0 (mixed)'}")
+        print(f"  • Williams %R {wr_val:.1f} → {'+0.4 (<-75)' if wr_val < -75 else '-0.4 (>-25)' if wr_val > -25 else 'no signal'}")
+    if combined_sent != 0.0:
+        contrib = min(0.5, combined_sent * 0.8) if combined_sent > 0.25 else (max(-0.5, combined_sent * 0.8) if combined_sent < -0.25 else 0.0)
+        if contrib != 0.0:
+            print(f"  • Sentiment {combined_sent:+.3f} → {contrib:+.3f}")
+    if obv_rising is not None:
+        print(f"  • OBV {'rising ↑ +0.25' if obv_rising else 'falling ↓ -0.25'} (volume confirmation)")
+    if vol_ratio_val is not None:
+        if vol_ratio_val > 2.0:
+            print(f"  • Volume ratio {vol_ratio_val:.2f}x → conf +0.10")
+        elif vol_ratio_val > 1.5:
+            print(f"  • Volume ratio {vol_ratio_val:.2f}x → conf +0.05")
+        elif vol_ratio_val < 0.5:
+            print(f"  • Volume ratio {vol_ratio_val:.2f}x → conf -0.10 (thin volume)")
     print()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Inspect indicator values and strategy decision for a ticker."
-    )
-    parser.add_argument("tickers", nargs="+", help="Ticker symbol(s), e.g. GARAN.IS AAPL EURUSD=X")
-    parser.add_argument(
-        "--timeframe", "-t",
-        choices=list(TIMEFRAME_CONFIG.keys()),
-        default="1h",
-        help="Timeframe to use (default: 1h)",
-    )
-    parser.add_argument(
-        "--strategy", "-s",
-        choices=["balanced", "momentum", "mean_reversion", "all"],
-        default="all",
-        help="Strategy to score (default: all three)",
-    )
-    parser.add_argument(
-        "--no-sentiment", action="store_true",
-        help="Skip news sentiment fetch (faster, offline-safe)",
-    )
+    parser = argparse.ArgumentParser(description="Full indicator + MTF debug for any ticker.")
+    parser.add_argument("tickers", nargs="+", help="Ticker(s), e.g. GARAN.IS AAPL EURUSD=X")
+    parser.add_argument("--strategy", "-s",
+                        choices=["balanced", "momentum", "mean_reversion", "all"],
+                        default="all")
+    parser.add_argument("--scope", default="BIST30",
+                        help="Market scope for macro sentiment (BIST30/NASDAQ/FOREX, default: BIST30)")
+    parser.add_argument("--no-sentiment", action="store_true",
+                        help="Skip news fetches (faster, works offline)")
     args = parser.parse_args()
 
-    strategies = ["balanced", "momentum", "mean_reversion"] if args.strategy == "all" else [args.strategy]
+    strategies = (
+        ["balanced", "momentum", "mean_reversion"]
+        if args.strategy == "all"
+        else [args.strategy]
+    )
+
+    # Fetch macro sentiment once for the whole run
+    if args.no_sentiment:
+        macro = {"global": 0.0, "market": 0.0}
+    else:
+        print(f"Fetching macro sentiment ({args.scope}) …", end=" ", flush=True)
+        macro = _fetch_macro(args.scope)
+        print(f"global={macro.get('global', 0.0):+.3f}  market={macro.get('market', 0.0):+.3f}")
 
     for ticker in args.tickers:
-        # Fetch sentiment once per ticker, share across all three strategy runs
+        # Fetch news sentiment
         if args.no_sentiment:
-            sent = 0.0
+            ticker_sentiment = 0.0
         else:
-            print(f"  Fetching news sentiment for {ticker} …", end=" ", flush=True)
-            sent = _fetch_sentiment(ticker)
-            print(f"{sent:+.3f}")
+            print(f"Fetching news for {ticker} …", end=" ", flush=True)
+            ticker_sentiment = _fetch_sentiment(ticker)
+            print(f"{ticker_sentiment:+.3f}")
+
+        # Fetch all timeframes once
+        print(f"Fetching data for {ticker} …")
+        data_by_tf: dict[str, pd.DataFrame] = {}
+        for tf, (period, interval) in TIMEFRAME_CONFIG.items():
+            d = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
+            if not d.empty:
+                data_by_tf[tf] = d
+                print(f"  {tf}: {len(d)} bars")
+
+        if not data_by_tf:
+            print(f"  ERROR: no data for {ticker}")
+            continue
+
         for strat in strategies:
-            analyze(ticker, args.timeframe, strat, sentiment=sent)
+            analyze_ticker(ticker, strat, ticker_sentiment, macro, data_by_tf)
 
 
 if __name__ == "__main__":

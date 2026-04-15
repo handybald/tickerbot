@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from .analytics import closed_trade_stats
 from .broker import PaperBrokerAdapter
+from .macro_sentiment import get_macro_sentiment, invalidate_cache as invalidate_macro_cache
 from .market import (
     CandleRequest,
     fetch_history,
@@ -163,21 +164,13 @@ class BotService:
             self.selected_timeframe,
         )
 
-        tf_period, tf_interval = TIMEFRAME_CONFIG.get(self.selected_timeframe, TIMEFRAME_CONFIG["1h"])
-        live_data = {}
-        for ticker in universe:
-            if self._is_ticker_blocked(ticker, now_local):
-                continue
-            try:
-                data = fetch_history(CandleRequest(ticker=ticker, period=tf_period, interval=tf_interval))
-                if not data.empty:
-                    self._clear_no_data_failure(ticker)
-                    live_data[ticker] = data
-                else:
-                    self._record_no_data_failure(ticker, settings, now_local)
-            except Exception as exc:
-                log.warning("live fetch failed for %s: %s", ticker, exc)
-                self._record_no_data_failure(ticker, settings, now_local)
+        # Build live_data from already-fetched timeframe_data (avoids duplicate fetch).
+        # Use the selected timeframe's data as the primary price source.
+        primary_tf_data = timeframe_data.get(self.selected_timeframe, {})
+        # Fall back to any available timeframe if selected TF has no data.
+        if not primary_tf_data:
+            primary_tf_data = next(iter(timeframe_data.values()), {})
+        live_data = primary_tf_data
 
         latest_prices = {t: float(df["Close"].iloc[-1]) for t, df in live_data.items() if not df.empty}
         if not latest_prices:
@@ -252,15 +245,38 @@ class BotService:
         positions = self.broker.get_positions()
         buys = 0
         sells = 0
+        # Macro sentiment — fetched once per cycle, shared across all tickers.
+        try:
+            macro = get_macro_sentiment(settings.market_scope)
+            macro_net = macro.get("global", 0.0) * 0.4 + macro.get("market", 0.0) * 0.6
+        except Exception:
+            macro_net = 0.0
+        log.info("Macro sentiment | global=%.3f market=%.3f net=%.3f",
+                 macro.get("global", 0.0) if isinstance(macro, dict) else 0.0,
+                 macro.get("market", 0.0) if isinstance(macro, dict) else 0.0,
+                 macro_net)
+
         signal_snapshot = []
         buys_today = self._buys_today(now_local)
         exits_by_rule = 0
 
         for ticker, data in live_data.items():
-            sentiment = self._get_sentiment(ticker)
-            action, confidence = self.strategy_manager.signal(
-                self.selected_strategy, self.selected_timeframe, data, sentiment=sentiment
+            ticker_sentiment = self._get_sentiment(ticker)
+
+            # Build per-ticker multi-timeframe data from the already-fetched universe.
+            ticker_data_by_tf = {
+                tf: timeframe_data[tf][ticker]
+                for tf in timeframe_data
+                if ticker in timeframe_data[tf]
+            }
+
+            mtf = self.strategy_manager.mtf_signal(
+                strategy=self.selected_strategy,
+                data_by_tf=ticker_data_by_tf,
+                ticker_sentiment=ticker_sentiment,
+                macro_sentiment=macro_net,
             )
+            action, confidence = mtf.action, mtf.confidence
             price = float(latest_prices[ticker])
             positions = self.broker.get_positions()
             pos = positions.get(ticker)
@@ -308,7 +324,8 @@ class BotService:
                     "action": action,
                     "confidence": float(confidence),
                     "price": price,
-                    "sentiment": round(sentiment, 3),
+                    "sentiment": round(ticker_sentiment, 3),
+                    "alignment": f"{mtf.alignment}/{mtf.total_tfs}",
                 }
             )
             if action == "HOLD" or confidence < dynamic_min_conf:
@@ -562,6 +579,7 @@ class BotService:
             else:
                 synced = sync_bist_universe()
                 label = "BIST"
+            invalidate_macro_cache()
             if not synced:
                 return "Universe sync failed; keeping cached/fallback universe."
             return f"Universe synced. {label} symbols cached: {len(synced)}"
@@ -616,15 +634,26 @@ class BotService:
     def _debug_ticker(self, ticker: str, settings: RuntimeSettings) -> str:
         from tickerbot.indicators import (
             calculate_adx, calculate_atr, calculate_bollinger_bands,
-            calculate_macd, calculate_rsi, calculate_stochastic, calculate_williams_r,
+            calculate_macd, calculate_obv, calculate_rsi, calculate_stochastic,
+            calculate_volume_ratio, calculate_williams_r,
         )
         from .strategy import _ADX_TREND_THRESHOLD, _MAX_ATR_PCT
 
-        tf = self.selected_timeframe
-        period, interval = TIMEFRAME_CONFIG.get(tf, TIMEFRAME_CONFIG["1h"])
-        data = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
-        if data.empty:
+        # Fetch all timeframes for MTF analysis
+        ticker_data_by_tf = {}
+        for tf, (period, interval) in TIMEFRAME_CONFIG.items():
+            try:
+                d = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
+                if not d.empty:
+                    ticker_data_by_tf[tf] = d
+            except Exception:
+                pass
+
+        if not ticker_data_by_tf:
             return f"No data for {ticker}"
+
+        tf = self.selected_timeframe
+        data = ticker_data_by_tf.get(tf) or next(iter(ticker_data_by_tf.values()))
 
         price = float(data["Close"].iloc[-1])
 
@@ -681,37 +710,71 @@ class BotService:
         is_trending = adx_val >= _ADX_TREND_THRESHOLD
         strategy = self.selected_strategy
 
-        raw = self.strategy_manager._raw_score(
+        # OBV trend
+        obv_rising = None
+        try:
+            obv = calculate_obv(data)
+            if not obv.dropna().empty and len(obv.dropna()) >= 20:
+                obv_sma = obv.rolling(20).mean()
+                obv_rising = float(obv.iloc[-1]) > float(obv_sma.dropna().iloc[-1])
+        except Exception:
+            pass
+
+        # Volume ratio
+        vol_ratio_val = None
+        try:
+            vr = calculate_volume_ratio(data)
+            if not vr.dropna().empty:
+                vol_ratio_val = float(vr.dropna().iloc[-1])
+        except Exception:
+            pass
+
+        # Macro sentiment
+        try:
+            macro = get_macro_sentiment(settings.market_scope)
+            macro_net = macro.get("global", 0.0) * 0.4 + macro.get("market", 0.0) * 0.6
+        except Exception:
+            macro_net = 0.0
+
+        ticker_sent = self._get_sentiment(ticker)
+        combined_sent = ticker_sent * 0.6 + macro_net * 0.4
+
+        # MTF signal
+        mtf = self.strategy_manager.mtf_signal(
             strategy=strategy,
-            price=price,
-            rsi=rsi_val,
-            macd_cross=cross,
-            upper_bb=upper_val,
-            lower_bb=lower_val,
-            adx=adx_val,
-            is_trending=is_trending,
-            di_trend_bullish=di_trend_bullish,
-            wr=wr_val,
-            stoch_k=stoch_k_val,
+            data_by_tf=ticker_data_by_tf,
+            ticker_sentiment=ticker_sent,
+            macro_sentiment=macro_net,
         )
-        conf = max(0.0, min(abs(raw) / 3.5, 1.0) - atr_penalty)
-        action = "BUY" if raw >= 1.3 else "SELL" if raw <= -1.3 else "HOLD"
 
         bb_pos = "above upper" if price > upper_val else "below lower" if price < lower_val else "inside"
         trend_str = f"TRENDING ({'bull' if di_trend_bullish else 'bear'})" if is_trending else "RANGING"
+        obv_str = ("rising ↑" if obv_rising else "falling ↓") if obv_rising is not None else "n/a"
+        vol_str = f"{vol_ratio_val:.2f}x avg" if vol_ratio_val is not None else "n/a"
 
         lines = [
             f"Debug: {ticker}  [{tf} | {strategy}]",
-            f"Price  : {price:.4f}",
-            f"RSI    : {rsi_val:.1f}",
-            f"MACD Δ : {cross:+.4f}  ({'bull' if cross > 0 else 'bear'})",
-            f"BB     : {bb_pos}  (lo={lower_val:.4f} hi={upper_val:.4f})",
-            f"ADX    : {adx_val:.1f}  {trend_str}  DI+={dip_val:.1f} DI-={dim_val:.1f}",
-            f"Wm%R   : {wr_val:.1f}",
-            f"Stoch  : {stoch_k_val:.1f}",
-            f"ATR pen: {atr_penalty:.2f}",
-            f"Score  : {raw:+.4f}  →  {action}  conf={conf:.2f}",
+            f"Price    : {price:.4f}",
+            f"RSI      : {rsi_val:.1f}",
+            f"MACD Δ   : {cross:+.4f}  ({'bull' if cross > 0 else 'bear'})",
+            f"BB       : {bb_pos}  (lo={lower_val:.4f} hi={upper_val:.4f})",
+            f"ADX      : {adx_val:.1f}  {trend_str}  DI+={dip_val:.1f} DI-={dim_val:.1f}",
+            f"Wm%R     : {wr_val:.1f}",
+            f"Stoch    : {stoch_k_val:.1f}",
+            f"OBV      : {obv_str}",
+            f"Volume   : {vol_str}",
+            f"ATR pen  : {atr_penalty:.2f}",
+            f"Ticker sent: {ticker_sent:+.3f}  Macro: {macro_net:+.3f}  Combined: {combined_sent:+.3f}",
+            "",
+            "Multi-Timeframe:",
         ]
+        for tfk in ("1d", "1h", "15m"):
+            if tfk in mtf.breakdown:
+                s = mtf.breakdown[tfk]
+                label = "trend" if tfk == "1d" else ("setup" if tfk == "1h" else "entry")
+                lines.append(f"  {tfk} ({label}): {s['action']:4s}  conf={s['confidence']:.2f}")
+        lines.append(f"  Alignment: {mtf.alignment}/{mtf.total_tfs} TFs agree")
+        lines.append(f"  >>> MTF: {mtf.action}  conf={mtf.confidence:.2f} <<<")
         return "\n".join(lines)
 
     def _get_sentiment(self, ticker: str) -> float:
@@ -754,9 +817,15 @@ class BotService:
         ]
         for row in top:
             sent = row.get("sentiment", 0.0)
-            sent_str = f" sent={sent:+.2f}" if sent != 0.0 else ""
+            align = row.get("alignment", "")
+            extras = []
+            if sent != 0.0:
+                extras.append(f"sent={sent:+.2f}")
+            if align:
+                extras.append(f"align={align}")
+            extra_str = "  " + " ".join(extras) if extras else ""
             lines.append(
-                f"- {row['ticker']} {row['action']} conf={row['confidence']:.2f} price={row['price']:.2f}{sent_str}"
+                f"- {row['ticker']} {row['action']} conf={row['confidence']:.2f} price={row['price']:.2f}{extra_str}"
             )
         return "\n".join(lines)
 

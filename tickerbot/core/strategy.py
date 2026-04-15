@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -10,8 +10,10 @@ from tickerbot.indicators import (
     calculate_atr,
     calculate_bollinger_bands,
     calculate_macd,
+    calculate_obv,
     calculate_rsi,
     calculate_stochastic,
+    calculate_volume_ratio,
     calculate_williams_r,
 )
 
@@ -21,6 +23,10 @@ TIMEFRAME_CONFIG = {
     "1h":  ("180d", "1h"),
     "1d":  ("2y", "1d"),
 }
+
+# Timeframe weights for multi-timeframe combination.
+# Higher timeframe carries more weight in the final decision.
+_MTF_WEIGHTS = {"1d": 0.50, "1h": 0.35, "15m": 0.15}
 
 # ADX threshold: below this value the market is considered range-bound.
 _ADX_TREND_THRESHOLD = 20.0
@@ -33,6 +39,17 @@ class StrategyChoice:
     name: str
     timeframe: str
     score: float
+
+
+@dataclass
+class MTFSignal:
+    """Result of a multi-timeframe signal analysis."""
+    action: str          # "BUY" | "SELL" | "HOLD"
+    confidence: float    # [0, 1]
+    alignment: int       # number of timeframes agreeing with the final direction
+    total_tfs: int       # total timeframes evaluated
+    breakdown: dict = field(default_factory=dict)
+    # breakdown: {"1d": {"action": "BUY", "confidence": 0.7}, ...}
 
 
 class StrategyManager:
@@ -60,7 +77,106 @@ class StrategyManager:
         return best
 
     # ------------------------------------------------------------------
-    # Signal generation
+    # Multi-timeframe signal (triple-screen)
+    # ------------------------------------------------------------------
+
+    def mtf_signal(
+        self,
+        strategy: str,
+        data_by_tf: dict[str, pd.DataFrame],
+        ticker_sentiment: float = 0.0,
+        macro_sentiment: float = 0.0,
+    ) -> MTFSignal:
+        """
+        Triple-screen multi-timeframe signal.
+
+        Screen 1 (1d) — Trend direction:
+            The daily chart sets the allowed trading direction.
+            If 1d is clearly bearish, no new BUY entries are made.
+            If 1d is clearly bullish, no new SELL entries are made.
+
+        Screen 2 (1h) — Setup confirmation:
+            The hourly chart identifies the specific setup within the trend.
+
+        Screen 3 (15m) — Entry timing:
+            The 15-minute chart times the precise entry.
+            Acts only when it aligns with higher-TF direction.
+
+        Combined sentiment = ticker_sentiment * 0.6 + macro_sentiment * 0.4
+        (macro context dilutes but does not dominate ticker-specific news)
+        """
+        # Blend ticker + macro sentiment
+        combined_sentiment = ticker_sentiment * 0.6 + macro_sentiment * 0.4
+
+        # Generate per-timeframe signals
+        tf_results: dict[str, dict] = {}
+        for tf, data in data_by_tf.items():
+            if data.empty or len(data) < 50:
+                continue
+            action, conf = self.signal(
+                strategy, tf, data, sentiment=combined_sentiment
+            )
+            tf_results[tf] = {"action": action, "confidence": conf}
+
+        if not tf_results:
+            return MTFSignal(action="HOLD", confidence=0.0, alignment=0,
+                             total_tfs=0, breakdown={})
+
+        # ── Triple-screen rule ─────────────────────────────────────────
+        # The highest available timeframe sets the allowed direction.
+        trend_tf = next(
+            (tf for tf in ("1d", "1h", "15m") if tf in tf_results), None
+        )
+        trend_action = tf_results[trend_tf]["action"] if trend_tf else "HOLD"
+
+        # Weighted directional score
+        weighted_score = 0.0
+        total_weight = 0.0
+        for tf, sig in tf_results.items():
+            w = _MTF_WEIGHTS.get(tf, 0.15)
+            vote = 1.0 if sig["action"] == "BUY" else (-1.0 if sig["action"] == "SELL" else 0.0)
+            weighted_score += vote * sig["confidence"] * w
+            total_weight += w
+        if total_weight > 0:
+            weighted_score /= total_weight
+
+        # Block signals that fight the dominant trend TF
+        if trend_action == "SELL" and weighted_score > 0.05:
+            return MTFSignal(action="HOLD", confidence=0.0, alignment=0,
+                             total_tfs=len(tf_results), breakdown=tf_results)
+        if trend_action == "BUY" and weighted_score < -0.05:
+            return MTFSignal(action="HOLD", confidence=0.0, alignment=0,
+                             total_tfs=len(tf_results), breakdown=tf_results)
+
+        # Determine final action
+        if weighted_score >= 0.20:
+            final_action = "BUY"
+        elif weighted_score <= -0.20:
+            final_action = "SELL"
+        else:
+            final_action = "HOLD"
+
+        # Count alignment
+        alignment = sum(
+            1 for s in tf_results.values()
+            if s["action"] == final_action
+        )
+
+        # Confidence: normalized weighted score + alignment bonus
+        base_conf = min(abs(weighted_score) / 0.50, 1.0)
+        alignment_bonus = (alignment - 1) * 0.08 if alignment > 1 else 0.0
+        confidence = min(base_conf + alignment_bonus, 1.0)
+
+        return MTFSignal(
+            action=final_action,
+            confidence=confidence,
+            alignment=alignment,
+            total_tfs=len(tf_results),
+            breakdown=tf_results,
+        )
+
+    # ------------------------------------------------------------------
+    # Single-timeframe signal generation
     # ------------------------------------------------------------------
 
     def signal(
@@ -70,32 +186,32 @@ class StrategyManager:
         data: pd.DataFrame,
         sentiment: float = 0.0,
     ) -> tuple[str, float]:
-        """Return (action, confidence) for a single bar series.
+        """Return (action, confidence) for a single timeframe bar series.
 
         action    : "BUY" | "SELL" | "HOLD"
         confidence: [0, 1]
-        sentiment : [-1, 1] news sentiment score; 0 = neutral / unavailable
+        sentiment : [-1, 1] combined news sentiment (ticker + macro already blended)
         """
         if data.empty or len(data) < 50:
             return "HOLD", 0.0
 
         price = float(data["Close"].iloc[-1])
 
-        # Core indicators
+        # ── Core price indicators ──────────────────────────────────────
         rsi = calculate_rsi(data)
         rsi_val = float(rsi.iloc[-1]) if not rsi.empty else 50.0
 
         macd, sig_line = calculate_macd(data)
         macd_last = float(macd.iloc[-1]) if not macd.empty else 0.0
-        sig_last = float(sig_line.iloc[-1]) if not sig_line.empty else 0.0
+        sig_last  = float(sig_line.iloc[-1]) if not sig_line.empty else 0.0
         macd_cross = macd_last - sig_last   # positive = bullish
 
         upper, lower = calculate_bollinger_bands(data)
         upper_val = float(upper.iloc[-1]) if not upper.empty else price * 1.05
         lower_val = float(lower.iloc[-1]) if not lower.empty else price * 0.95
 
-        # ADX – only valid when High/Low columns exist
-        adx_val = 25.0   # default: assume trending if data unavailable
+        # ADX
+        adx_val = 25.0
         di_trend_bullish = True
         try:
             adx_series, di_plus, di_minus = calculate_adx(data)
@@ -106,7 +222,7 @@ class StrategyManager:
             pass
 
         # Williams %R
-        wr_val = -50.0   # default neutral
+        wr_val = -50.0
         try:
             wr = calculate_williams_r(data)
             if not wr.dropna().empty:
@@ -123,7 +239,7 @@ class StrategyManager:
         except Exception:
             pass
 
-        # ATR-based confidence penalty (high volatility → lower confidence)
+        # ── ATR confidence penalty ─────────────────────────────────────
         atr_penalty = 0.0
         try:
             atr = calculate_atr(data)
@@ -131,6 +247,36 @@ class StrategyManager:
                 atr_pct = float(atr.iloc[-1]) / price
                 if atr_pct > _MAX_ATR_PCT:
                     atr_penalty = min(0.25, (atr_pct - _MAX_ATR_PCT) / _MAX_ATR_PCT * 0.25)
+        except Exception:
+            pass
+
+        # ── Volume analysis ────────────────────────────────────────────
+        # OBV trend: rising OBV = volume confirms the up move; falling = confirms down move
+        obv_contribution = 0.0
+        vol_conf_mod = 0.0
+        try:
+            obv = calculate_obv(data)
+            if not obv.dropna().empty and len(obv.dropna()) >= 20:
+                obv_sma = obv.rolling(20).mean()
+                obv_rising = float(obv.iloc[-1]) > float(obv_sma.dropna().iloc[-1])
+                # OBV confirms or diverges from price signal direction
+                if obv_rising:
+                    obv_contribution = 0.25    # bullish volume flow
+                else:
+                    obv_contribution = -0.25   # bearish volume flow
+        except Exception:
+            pass
+
+        try:
+            vol_ratio = calculate_volume_ratio(data)
+            if not vol_ratio.dropna().empty:
+                vr = float(vol_ratio.dropna().iloc[-1])
+                if vr > 2.0:
+                    vol_conf_mod = 0.10    # very high activity → confirms direction
+                elif vr > 1.5:
+                    vol_conf_mod = 0.05
+                elif vr < 0.5:
+                    vol_conf_mod = -0.10   # thin volume → signal less reliable
         except Exception:
             pass
 
@@ -151,7 +297,13 @@ class StrategyManager:
             sentiment=sentiment,
         )
 
-        confidence = min(abs(score) / 3.5, 1.0) - atr_penalty
+        # OBV contributes in the same direction as the current score tendency
+        if score > 0:
+            score += obv_contribution
+        elif score < 0:
+            score -= obv_contribution  # reverses sign: bearish OBV makes negative score worse
+
+        confidence = min(abs(score) / 3.5, 1.0) - atr_penalty + vol_conf_mod
         confidence = max(0.0, confidence)
 
         if score >= 1.3:
@@ -246,9 +398,8 @@ class StrategyManager:
             elif wr > -25:
                 score -= 0.4
 
-        # News sentiment adjustment — small additive tilt, never the primary driver.
-        # Only fires when sentiment is clearly positive (>0.25) or negative (<-0.25).
-        # Capped at ±0.5 so it can tip a borderline signal but cannot create one alone.
+        # News sentiment: small additive tilt, never the primary driver.
+        # Capped at ±0.5 — can tip a borderline signal, cannot create one alone.
         if sentiment > 0.25:
             score += min(0.5, sentiment * 0.8)
         elif sentiment < -0.25:
