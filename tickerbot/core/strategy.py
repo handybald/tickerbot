@@ -185,6 +185,7 @@ class StrategyManager:
         timeframe: str,
         data: pd.DataFrame,
         sentiment: float = 0.0,
+        params: dict | None = None,
     ) -> tuple[str, float]:
         """Return (action, confidence) for a single timeframe bar series.
 
@@ -254,16 +255,13 @@ class StrategyManager:
         # OBV trend: rising OBV = volume confirms the up move; falling = confirms down move
         obv_contribution = 0.0
         vol_conf_mod = 0.0
+        _obv_w = (params or {}).get("obv_weight", 0.25)
         try:
             obv = calculate_obv(data)
             if not obv.dropna().empty and len(obv.dropna()) >= 20:
                 obv_sma = obv.rolling(20).mean()
                 obv_rising = float(obv.iloc[-1]) > float(obv_sma.dropna().iloc[-1])
-                # OBV confirms or diverges from price signal direction
-                if obv_rising:
-                    obv_contribution = 0.25    # bullish volume flow
-                else:
-                    obv_contribution = -0.25   # bearish volume flow
+                obv_contribution = _obv_w if obv_rising else -_obv_w
         except Exception:
             pass
 
@@ -295,20 +293,22 @@ class StrategyManager:
             wr=wr_val,
             stoch_k=stoch_k_val,
             sentiment=sentiment,
+            params=params,
         )
 
         # OBV contributes in the same direction as the current score tendency
         if score > 0:
             score += obv_contribution
         elif score < 0:
-            score -= obv_contribution  # reverses sign: bearish OBV makes negative score worse
+            score -= obv_contribution
 
-        confidence = min(abs(score) / 3.5, 1.0) - atr_penalty + vol_conf_mod
+        threshold = (params or {}).get("signal_threshold", 1.3)
+        confidence = min(abs(score) / (threshold * 2.7), 1.0) - atr_penalty + vol_conf_mod
         confidence = max(0.0, confidence)
 
-        if score >= 1.3:
+        if score >= threshold:
             return "BUY", confidence
-        if score <= -1.3:
+        if score <= -threshold:
             return "SELL", confidence
         return "HOLD", confidence
 
@@ -326,84 +326,84 @@ class StrategyManager:
         wr: float,
         stoch_k: float,
         sentiment: float = 0.0,
+        params: dict | None = None,
     ) -> float:
+        p = params or {}
         score = 0.0
 
         if strategy == "momentum":
-            # Momentum: rides trends – require at least moderate trend strength.
             if not is_trending:
                 return 0.0
             if macd_cross > 0:
-                score += 1.5
+                score += p.get("m_macd_bull", 1.5)
             else:
-                score -= 1.0
-            if rsi > 55:
-                score += 0.8
+                score -= p.get("m_macd_bear", 1.0)
+            if rsi > p.get("m_rsi_thresh", 55.0):
+                score += p.get("m_rsi_bull", 0.8)
             if rsi > 78:
-                score -= 0.7   # too overbought even for momentum
-            if wr > -30:       # near overbought – momentum continuation
-                score += 0.4
-            if wr < -70:       # losing steam
-                score -= 0.4
+                score -= p.get("m_rsi_ob_penalty", 0.7)
+            if wr > -30:
+                score += p.get("m_wr_score", 0.4)
+            if wr < -70:
+                score -= p.get("m_wr_score", 0.4)
             if di_trend_bullish and macd_cross > 0:
-                score += 0.5
+                score += p.get("m_di_score", 0.5)
             elif not di_trend_bullish and macd_cross < 0:
-                score -= 0.5
-            if stoch_k > 60:
-                score += 0.3
+                score -= p.get("m_di_score", 0.5)
+            if stoch_k > p.get("m_stoch_thresh", 60.0):
+                score += p.get("m_stoch_score", 0.3)
             if stoch_k > 85:
-                score -= 0.3   # short-term top
+                score -= p.get("m_stoch_score", 0.3)
 
         elif strategy == "mean_reversion":
-            # Mean Reversion: fades extremes – blocked in very strong trends.
-            if is_trending and adx > 35:
+            if is_trending and adx > p.get("mr_adx_block", 35.0):
                 return 0.0
             if price < lower_bb:
-                score += 1.5
+                score += p.get("mr_bb_score", 1.5)
             elif price > upper_bb:
-                score -= 1.5
+                score -= p.get("mr_bb_score", 1.5)
             if rsi < 30:
-                score += 1.0
+                score += p.get("mr_rsi_score", 1.0)
             elif rsi > 70:
-                score -= 1.0
+                score -= p.get("mr_rsi_score", 1.0)
             if wr < -80:
-                score += 0.8
+                score += p.get("mr_wr_score", 0.8)
             elif wr > -20:
-                score -= 0.8
+                score -= p.get("mr_wr_score", 0.8)
             if stoch_k < 20:
-                score += 0.5
+                score += p.get("mr_stoch_score", 0.5)
             elif stoch_k > 80:
-                score -= 0.5
+                score -= p.get("mr_stoch_score", 0.5)
 
-        else:   # balanced (default)
+        else:   # balanced
             if macd_cross > 0:
-                score += 1.0
+                score += p.get("b_macd_score", 1.0)
             else:
-                score -= 1.0
-            if rsi < 35:
-                score += 1.0
+                score -= p.get("b_macd_score", 1.0)
+            if rsi < p.get("b_rsi_os_thresh", 35.0):
+                score += p.get("b_rsi_score", 1.0)
             elif rsi > 70:
-                score -= 1.0
+                score -= p.get("b_rsi_score", 1.0)
             if price < lower_bb:
-                score += 0.7
+                score += p.get("b_bb_score", 0.7)
             elif price > upper_bb:
-                score -= 0.7
+                score -= p.get("b_bb_score", 0.7)
             if is_trending:
                 if macd_cross > 0 and di_trend_bullish:
-                    score += 0.4
+                    score += p.get("b_adx_boost", 0.4)
                 elif macd_cross < 0 and not di_trend_bullish:
-                    score -= 0.4
+                    score -= p.get("b_adx_boost", 0.4)
             if wr < -75:
-                score += 0.4
+                score += p.get("b_wr_score", 0.4)
             elif wr > -25:
-                score -= 0.4
+                score -= p.get("b_wr_score", 0.4)
 
-        # News sentiment: small additive tilt, never the primary driver.
-        # Capped at ±0.5 — can tip a borderline signal, cannot create one alone.
+        # Sentiment tilt
+        sent_cap = p.get("sentiment_cap", 0.5)
         if sentiment > 0.25:
-            score += min(0.5, sentiment * 0.8)
+            score += min(sent_cap, sentiment * 0.8)
         elif sentiment < -0.25:
-            score += max(-0.5, sentiment * 0.8)
+            score += max(-sent_cap, sentiment * 0.8)
 
         return score
 
