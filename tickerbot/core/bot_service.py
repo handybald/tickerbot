@@ -497,6 +497,7 @@ class BotService:
                 "/csv [days] — export trades CSV\n"
                 "/on — enable trading\n"
                 "/off — disable trading\n"
+                "/debug <ticker> — show indicator values & score\n"
                 "\nKey settings:\n"
                 "  market_scope: BIST30 | BIST | NASDAQ | FOREX\n"
                 "  daily_profit_target_enabled / daily_profit_target_pct\n"
@@ -584,6 +585,12 @@ class BotService:
             self._persist_runtime_state()
             return "Trading disabled."
 
+        if cmd.startswith("/debug"):
+            parts = cmd.split(maxsplit=1)
+            if len(parts) < 2:
+                return "Usage: /debug <ticker>  e.g. /debug GARAN.IS"
+            return self._debug_ticker(parts[1].strip().upper(), settings)
+
         if cmd.startswith("/set "):
             parts = cmd.split(maxsplit=2)
             if len(parts) < 3:
@@ -598,6 +605,107 @@ class BotService:
                 return f"Failed to update setting: {exc}"
 
         return "Unknown command. Send /help"
+
+    def _debug_ticker(self, ticker: str, settings: RuntimeSettings) -> str:
+        from tickerbot.indicators import (
+            calculate_adx, calculate_atr, calculate_bollinger_bands,
+            calculate_macd, calculate_rsi, calculate_stochastic, calculate_williams_r,
+        )
+        from .strategy import _ADX_TREND_THRESHOLD, _MAX_ATR_PCT
+
+        tf = self.selected_timeframe
+        period, interval = TIMEFRAME_CONFIG.get(tf, TIMEFRAME_CONFIG["1h"])
+        data = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
+        if data.empty:
+            return f"No data for {ticker}"
+
+        price = float(data["Close"].iloc[-1])
+
+        rsi = calculate_rsi(data)
+        rsi_val = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else 50.0
+
+        macd, sig_line = calculate_macd(data)
+        macd_last = float(macd.dropna().iloc[-1]) if not macd.dropna().empty else 0.0
+        sig_last = float(sig_line.dropna().iloc[-1]) if not sig_line.dropna().empty else 0.0
+        cross = macd_last - sig_last
+
+        upper_bb, lower_bb = calculate_bollinger_bands(data)
+        upper_val = float(upper_bb.dropna().iloc[-1]) if not upper_bb.dropna().empty else price * 1.05
+        lower_val = float(lower_bb.dropna().iloc[-1]) if not lower_bb.dropna().empty else price * 0.95
+
+        adx_val, dip_val, dim_val = 25.0, 0.0, 0.0
+        di_trend_bullish = True
+        try:
+            adx_s, di_plus, di_minus = calculate_adx(data)
+            if not adx_s.dropna().empty:
+                adx_val = float(adx_s.dropna().iloc[-1])
+                dip_val = float(di_plus.dropna().iloc[-1])
+                dim_val = float(di_minus.dropna().iloc[-1])
+                di_trend_bullish = dip_val > dim_val
+        except Exception:
+            pass
+
+        wr_val = -50.0
+        try:
+            wr = calculate_williams_r(data)
+            if not wr.dropna().empty:
+                wr_val = float(wr.dropna().iloc[-1])
+        except Exception:
+            pass
+
+        stoch_k_val = 50.0
+        try:
+            stoch_k, _ = calculate_stochastic(data)
+            if not stoch_k.dropna().empty:
+                stoch_k_val = float(stoch_k.dropna().iloc[-1])
+        except Exception:
+            pass
+
+        atr_penalty = 0.0
+        try:
+            atr = calculate_atr(data)
+            if not atr.dropna().empty and price > 0:
+                atr_pct = float(atr.dropna().iloc[-1]) / price
+                if atr_pct > _MAX_ATR_PCT:
+                    atr_penalty = min(0.25, (atr_pct - _MAX_ATR_PCT) / _MAX_ATR_PCT * 0.25)
+        except Exception:
+            pass
+
+        is_trending = adx_val >= _ADX_TREND_THRESHOLD
+        strategy = self.selected_strategy
+
+        raw = self.strategy_manager._raw_score(
+            strategy=strategy,
+            price=price,
+            rsi=rsi_val,
+            macd_cross=cross,
+            upper_bb=upper_val,
+            lower_bb=lower_val,
+            adx=adx_val,
+            is_trending=is_trending,
+            di_trend_bullish=di_trend_bullish,
+            wr=wr_val,
+            stoch_k=stoch_k_val,
+        )
+        conf = max(0.0, min(abs(raw) / 3.5, 1.0) - atr_penalty)
+        action = "BUY" if raw >= 1.3 else "SELL" if raw <= -1.3 else "HOLD"
+
+        bb_pos = "above upper" if price > upper_val else "below lower" if price < lower_val else "inside"
+        trend_str = f"TRENDING ({'bull' if di_trend_bullish else 'bear'})" if is_trending else "RANGING"
+
+        lines = [
+            f"Debug: {ticker}  [{tf} | {strategy}]",
+            f"Price  : {price:.4f}",
+            f"RSI    : {rsi_val:.1f}",
+            f"MACD Δ : {cross:+.4f}  ({'bull' if cross > 0 else 'bear'})",
+            f"BB     : {bb_pos}  (lo={lower_val:.4f} hi={upper_val:.4f})",
+            f"ADX    : {adx_val:.1f}  {trend_str}  DI+={dip_val:.1f} DI-={dim_val:.1f}",
+            f"Wm%R   : {wr_val:.1f}",
+            f"Stoch  : {stoch_k_val:.1f}",
+            f"ATR pen: {atr_penalty:.2f}",
+            f"Score  : {raw:+.4f}  →  {action}  conf={conf:.2f}",
+        ]
+        return "\n".join(lines)
 
     def _latest_position_prices(self) -> dict[str, float]:
         latest_prices = {}
