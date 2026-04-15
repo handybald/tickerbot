@@ -7,11 +7,14 @@ Usage:
     python debug_signals.py TICKER [TICKER2 ...] [--strategy balanced|momentum|mean_reversion|all]
     python debug_signals.py GARAN.IS
     python debug_signals.py AVGO --strategy momentum
+    python debug_signals.py AVGO --strategy momentum --params optimized_params_momentum.json
     python debug_signals.py EURUSD=X --no-sentiment
 """
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 import pandas as pd
 
@@ -68,6 +71,7 @@ def analyze_ticker(
     ticker_sentiment: float,
     macro: dict[str, float],
     data_by_tf: dict[str, pd.DataFrame],
+    params: dict | None = None,
 ) -> None:
     """Print full indicator + MTF breakdown for one ticker / strategy combo."""
     macro_net = macro.get("global", 0.0) * 0.4 + macro.get("market", 0.0) * 0.6
@@ -85,8 +89,9 @@ def analyze_ticker(
     data = data_by_tf[display_tf]
     price = float(data["Close"].iloc[-1])
 
+    params_label = "  [optimised params]" if params else "  [default params]"
     print(f"\n{_BAR}")
-    print(f"  {ticker}  |  strategy={strategy}")
+    print(f"  {ticker}  |  strategy={strategy}{params_label}")
     print(f"  Bars: {display_tf}={len(data)}" +
           "".join(f"  {tf}={len(data_by_tf[tf])}" for tf in ("15m", "1d") if tf in data_by_tf))
     print(_BAR)
@@ -225,6 +230,7 @@ def analyze_ticker(
         data_by_tf=data_by_tf,
         ticker_sentiment=ticker_sentiment,
         macro_sentiment=macro_net,
+        params=params,
     )
 
     tf_labels = {"1d": "trend frame", "1h": "setup frame", "15m": "entry frame"}
@@ -246,6 +252,7 @@ def analyze_ticker(
 
     # ── Single-TF score breakdown for reference ───────────────────────────
     print(f"\n  Single-TF score breakdown ({display_tf}):")
+    p = params or {}
     raw = manager._raw_score(
         strategy=strategy,
         price=price,
@@ -259,39 +266,66 @@ def analyze_ticker(
         wr=wr_val,
         stoch_k=stoch_k_val,
         sentiment=combined_sent,
+        params=params,
     )
-    print(f"  Raw score: {raw:+.4f}  (threshold ±1.3)")
+    threshold = p.get("signal_threshold", 1.3)
+    obv_w     = p.get("obv_weight", 0.25)
+    sent_cap  = p.get("sentiment_cap", 0.5)
+    print(f"  Raw score: {raw:+.4f}  (threshold ±{threshold:.2f})")
     if strategy == "momentum":
+        macd_bull = p.get("m_macd_bull", 1.5)
+        macd_bear = p.get("m_macd_bear", 1.0)
+        rsi_thresh = p.get("m_rsi_thresh", 55.0)
+        rsi_bull = p.get("m_rsi_bull", 0.8)
+        rsi_ob_pen = p.get("m_rsi_ob_penalty", 0.7)
+        wr_score = p.get("m_wr_score", 0.4)
+        di_score = p.get("m_di_score", 0.5)
+        stoch_thresh = p.get("m_stoch_thresh", 60.0)
+        stoch_score = p.get("m_stoch_score", 0.3)
         if not is_trending:
             print("  ✗ ADX<20 — not trending, score zeroed")
         else:
-            print(f"  • MACD {cross:+.4f} → {'  +1.5' if cross > 0 else '  -1.0'}")
-            print(f"  • RSI {rsi_val:.1f} → {'+0.8 (>55)' if rsi_val > 55 else 'no boost'}{' -0.7 (>78)' if rsi_val > 78 else ''}")
-            print(f"  • Williams %R {wr_val:.1f} → {'+0.4' if wr_val > -30 else '-0.4 (losing steam)' if wr_val < -70 else 'no signal'}")
-            print(f"  • DI align → {'+0.5' if di_trend_bullish and cross > 0 else '-0.5' if not di_trend_bullish and cross < 0 else 'mixed'}")
-            print(f"  • Stoch {stoch_k_val:.1f} → {'+0.3' if stoch_k_val > 60 else 'no signal'}{' -0.3 (top)' if stoch_k_val > 85 else ''}")
+            print(f"  • MACD {cross:+.4f} → {f'+{macd_bull:.2f}' if cross > 0 else f'-{macd_bear:.2f}'}")
+            rsi_note = f"+{rsi_bull:.2f} (>{rsi_thresh:.0f})" if rsi_val > rsi_thresh else "no boost"
+            if rsi_val > 78:
+                rsi_note += f" -{rsi_ob_pen:.2f} (>78 overbought)"
+            print(f"  • RSI {rsi_val:.1f} → {rsi_note}")
+            print(f"  • Williams %R {wr_val:.1f} → {f'+{wr_score:.2f}' if wr_val > -30 else f'-{wr_score:.2f} (losing steam)' if wr_val < -70 else 'no signal'}")
+            print(f"  • DI align → {f'+{di_score:.2f}' if di_trend_bullish and cross > 0 else f'-{di_score:.2f}' if not di_trend_bullish and cross < 0 else 'mixed'}")
+            print(f"  • Stoch {stoch_k_val:.1f} → {f'+{stoch_score:.2f}' if stoch_k_val > stoch_thresh else 'no signal'}{f' -{stoch_score:.2f} (top)' if stoch_k_val > 85 else ''}")
     elif strategy == "mean_reversion":
-        if is_trending and adx_val > 35:
-            print("  ✗ ADX>35 strong trend — mean reversion blocked")
+        adx_block = p.get("mr_adx_block", 35.0)
+        bb_score  = p.get("mr_bb_score", 1.5)
+        rsi_score = p.get("mr_rsi_score", 1.0)
+        wr_score  = p.get("mr_wr_score", 0.8)
+        stoch_score = p.get("mr_stoch_score", 0.5)
+        if is_trending and adx_val > adx_block:
+            print(f"  ✗ ADX>{adx_block:.0f} strong trend — mean reversion blocked")
         else:
-            bb_c = "+1.5 (below lower)" if price < lower_val else "-1.5 (above upper)" if price > upper_val else "0 (inside)"
+            bb_c = f"+{bb_score:.2f} (below lower)" if price < lower_val else f"-{bb_score:.2f} (above upper)" if price > upper_val else "0 (inside)"
             print(f"  • BB → {bb_c}")
-            print(f"  • RSI {rsi_val:.1f} → {'+1.0 (<30)' if rsi_val < 30 else '-1.0 (>70)' if rsi_val > 70 else 'no signal'}")
-            print(f"  • Williams %R {wr_val:.1f} → {'+0.8 (<-80)' if wr_val < -80 else '-0.8 (>-20)' if wr_val > -20 else 'no signal'}")
-            print(f"  • Stoch {stoch_k_val:.1f} → {'+0.5 (<20)' if stoch_k_val < 20 else '-0.5 (>80)' if stoch_k_val > 80 else 'no signal'}")
+            print(f"  • RSI {rsi_val:.1f} → {f'+{rsi_score:.2f} (<30)' if rsi_val < 30 else f'-{rsi_score:.2f} (>70)' if rsi_val > 70 else 'no signal'}")
+            print(f"  • Williams %R {wr_val:.1f} → {f'+{wr_score:.2f} (<-80)' if wr_val < -80 else f'-{wr_score:.2f} (>-20)' if wr_val > -20 else 'no signal'}")
+            print(f"  • Stoch {stoch_k_val:.1f} → {f'+{stoch_score:.2f} (<20)' if stoch_k_val < 20 else f'-{stoch_score:.2f} (>80)' if stoch_k_val > 80 else 'no signal'}")
     else:  # balanced
-        print(f"  • MACD {cross:+.4f} → {'  +1.0' if cross > 0 else '  -1.0'}")
-        print(f"  • RSI {rsi_val:.1f} → {'+1.0 (<35)' if rsi_val < 35 else '-1.0 (>70)' if rsi_val > 70 else 'no signal'}")
-        print(f"  • BB → {'+0.7 (below lower)' if price < lower_val else '-0.7 (above upper)' if price > upper_val else '0 (inside)'}")
+        macd_score  = p.get("b_macd_score", 1.0)
+        rsi_os      = p.get("b_rsi_os_thresh", 35.0)
+        rsi_score   = p.get("b_rsi_score", 1.0)
+        bb_score    = p.get("b_bb_score", 0.7)
+        adx_boost   = p.get("b_adx_boost", 0.4)
+        wr_score    = p.get("b_wr_score", 0.4)
+        print(f"  • MACD {cross:+.4f} → {f'+{macd_score:.2f}' if cross > 0 else f'-{macd_score:.2f}'}")
+        print(f"  • RSI {rsi_val:.1f} → {f'+{rsi_score:.2f} (<{rsi_os:.0f})' if rsi_val < rsi_os else f'-{rsi_score:.2f} (>70)' if rsi_val > 70 else 'no signal'}")
+        print(f"  • BB → {f'+{bb_score:.2f} (below lower)' if price < lower_val else f'-{bb_score:.2f} (above upper)' if price > upper_val else '0 (inside)'}")
         if is_trending:
-            print(f"  • ADX boost → {'+0.4' if cross > 0 and di_trend_bullish else '-0.4' if cross < 0 and not di_trend_bullish else '0 (mixed)'}")
-        print(f"  • Williams %R {wr_val:.1f} → {'+0.4 (<-75)' if wr_val < -75 else '-0.4 (>-25)' if wr_val > -25 else 'no signal'}")
+            print(f"  • ADX boost → {f'+{adx_boost:.2f}' if cross > 0 and di_trend_bullish else f'-{adx_boost:.2f}' if cross < 0 and not di_trend_bullish else '0 (mixed)'}")
+        print(f"  • Williams %R {wr_val:.1f} → {f'+{wr_score:.2f} (<-75)' if wr_val < -75 else f'-{wr_score:.2f} (>-25)' if wr_val > -25 else 'no signal'}")
     if combined_sent != 0.0:
-        contrib = min(0.5, combined_sent * 0.8) if combined_sent > 0.25 else (max(-0.5, combined_sent * 0.8) if combined_sent < -0.25 else 0.0)
+        contrib = min(sent_cap, combined_sent * 0.8) if combined_sent > 0.25 else (max(-sent_cap, combined_sent * 0.8) if combined_sent < -0.25 else 0.0)
         if contrib != 0.0:
-            print(f"  • Sentiment {combined_sent:+.3f} → {contrib:+.3f}")
+            print(f"  • Sentiment {combined_sent:+.3f} → {contrib:+.3f}  (cap={sent_cap:.2f})")
     if obv_rising is not None:
-        print(f"  • OBV {'rising ↑ +0.25' if obv_rising else 'falling ↓ -0.25'} (volume confirmation)")
+        print(f"  • OBV {'rising ↑' if obv_rising else 'falling ↓'} {'+' if obv_rising else '-'}{obv_w:.2f} (volume confirmation)")
     if vol_ratio_val is not None:
         if vol_ratio_val > 2.0:
             print(f"  • Volume ratio {vol_ratio_val:.2f}x → conf +0.10")
@@ -323,7 +357,26 @@ def main() -> None:
                              "Auto-detected from ticker if not set.")
     parser.add_argument("--no-sentiment", action="store_true",
                         help="Skip news fetches (faster, works offline)")
+    parser.add_argument("--params", "-p", default=None,
+                        help="Path to optimized params JSON (from optimize.py --save). "
+                             "If omitted, default weights are used.")
     args = parser.parse_args()
+
+    # Load optimized params if provided
+    opt_params: dict | None = None
+    if args.params:
+        path = Path(args.params)
+        if not path.exists():
+            print(f"ERROR: params file not found: {path}")
+            raise SystemExit(1)
+        data = json.loads(path.read_text())
+        # Support both raw dict and the format saved by optimize.py (has "params" key)
+        opt_params = data.get("params", data)
+        strategy_hint = data.get("strategy")
+        print(f"Loaded params from {path}" +
+              (f"  [strategy={strategy_hint}]" if strategy_hint else ""))
+        if args.strategy == "all" and strategy_hint:
+            print(f"  (tip: run with --strategy {strategy_hint} to match the optimised strategy)")
 
     strategies = (
         ["balanced", "momentum", "mean_reversion"]
@@ -365,7 +418,7 @@ def main() -> None:
             continue
 
         for strat in strategies:
-            analyze_ticker(ticker, strat, ticker_sentiment, macro, data_by_tf)
+            analyze_ticker(ticker, strat, ticker_sentiment, macro, data_by_tf, params=opt_params)
 
 
 if __name__ == "__main__":

@@ -86,6 +86,7 @@ class StrategyManager:
         data_by_tf: dict[str, pd.DataFrame],
         ticker_sentiment: float = 0.0,
         macro_sentiment: float = 0.0,
+        params: dict | None = None,
     ) -> MTFSignal:
         """
         Triple-screen multi-timeframe signal.
@@ -114,7 +115,7 @@ class StrategyManager:
             if data.empty or len(data) < 50:
                 continue
             action, conf = self.signal(
-                strategy, tf, data, sentiment=combined_sentiment
+                strategy, tf, data, sentiment=combined_sentiment, params=params
             )
             tf_results[tf] = {"action": action, "confidence": conf}
 
