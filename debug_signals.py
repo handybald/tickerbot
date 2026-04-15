@@ -302,14 +302,25 @@ def analyze_ticker(
     print()
 
 
+def _infer_scope(ticker: str) -> str:
+    """Infer the market scope from the ticker symbol."""
+    t = ticker.upper()
+    if t.endswith(".IS"):
+        return "BIST30"
+    if t.endswith("=X") or t.endswith("=F"):
+        return "FOREX"
+    return "NASDAQ"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Full indicator + MTF debug for any ticker.")
     parser.add_argument("tickers", nargs="+", help="Ticker(s), e.g. GARAN.IS AAPL EURUSD=X")
     parser.add_argument("--strategy", "-s",
                         choices=["balanced", "momentum", "mean_reversion", "all"],
                         default="all")
-    parser.add_argument("--scope", default="BIST30",
-                        help="Market scope for macro sentiment (BIST30/NASDAQ/FOREX, default: BIST30)")
+    parser.add_argument("--scope", default=None,
+                        help="Market scope for macro sentiment (BIST30/NASDAQ/FOREX). "
+                             "Auto-detected from ticker if not set.")
     parser.add_argument("--no-sentiment", action="store_true",
                         help="Skip news fetches (faster, works offline)")
     args = parser.parse_args()
@@ -320,12 +331,15 @@ def main() -> None:
         else [args.strategy]
     )
 
+    # Auto-detect scope from the first ticker if not explicitly set
+    scope = args.scope or _infer_scope(args.tickers[0])
+
     # Fetch macro sentiment once for the whole run
     if args.no_sentiment:
         macro = {"global": 0.0, "market": 0.0}
     else:
-        print(f"Fetching macro sentiment ({args.scope}) …", end=" ", flush=True)
-        macro = _fetch_macro(args.scope)
+        print(f"Fetching macro sentiment ({scope}) …", end=" ", flush=True)
+        macro = _fetch_macro(scope)
         print(f"global={macro.get('global', 0.0):+.3f}  market={macro.get('market', 0.0):+.3f}")
 
     for ticker in args.tickers:
