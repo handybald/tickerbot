@@ -1,0 +1,41 @@
+{
+  "strategy": "momentum",
+  "tickers": [
+    "GARAN.IS",
+    "THYAO.IS",
+    "EREGL.IS",
+    "BIMAS.IS",
+    "AKBNK.IS"
+  ],
+  "holdout_days": 120,
+  "params": {
+    "signal_threshold": 0.9013905747210313,
+    "obv_weight": 0.05234357420879771,
+    "sentiment_cap": 0.39667134823439015,
+    "m_macd_bull": 1.9234159961472392,
+    "m_macd_bear": 1.7537796510767745,
+    "m_rsi_thresh": 59.13082093297717,
+    "m_rsi_bull": 1.8239428777332558,
+    "m_rsi_ob_penalty": 0.37621086622527866,
+    "m_wr_score": 0.9677532509378732,
+    "m_di_score": 1.2895533494339626,
+    "m_stoch_thresh": 71.48297494621895,
+    "m_stoch_score": 0.43514157827473665
+  },
+  "train_metrics": {
+    "sharpe": -1.0060012048132922,
+    "total_return": -0.02702324071792402,
+    "hit_rate": 0.36418350168350166,
+    "max_drawdown": -0.03646099767948868,
+    "profit_factor": 0.6761998500874693,
+    "num_trades": 224
+  },
+  "test_metrics": {
+    "sharpe": 0.8611761423719161,
+    "total_return": 0.006392829850891321,
+    "hit_rate": 0.5173160173160173,
+    "max_drawdown": -0.012892152496925668,
+    "profit_factor": 1.403002551409822,
+    "num_trades": 75
+  }
+}

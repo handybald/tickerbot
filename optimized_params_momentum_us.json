@@ -1,0 +1,39 @@
+{
+  "strategy": "momentum",
+  "tickers": [
+    "AVGO",
+    "AAPL",
+    "MSFT"
+  ],
+  "holdout_days": 60,
+  "params": {
+    "signal_threshold": 2.051923560830835,
+    "obv_weight": 0.1621994344932609,
+    "sentiment_cap": 0.5637558099532113,
+    "m_macd_bull": 0.6765179671660141,
+    "m_macd_bear": 1.0859456765363629,
+    "m_rsi_thresh": 58.83145602707255,
+    "m_rsi_bull": 0.5164956757736068,
+    "m_rsi_ob_penalty": 0.6021568711181213,
+    "m_wr_score": 0.47846032308060615,
+    "m_di_score": 0.25158901373112774,
+    "m_stoch_thresh": 71.16373604825458,
+    "m_stoch_score": 0.3595136341011665
+  },
+  "train_metrics": {
+    "sharpe": -0.20531332713928074,
+    "total_return": 0.0002321226155199112,
+    "hit_rate": 0.3333333333333333,
+    "max_drawdown": -0.002209451250968001,
+    "profit_factor": Infinity,
+    "num_trades": 6
+  },
+  "test_metrics": {
+    "sharpe": 0.0,
+    "total_return": 0.0,
+    "hit_rate": 0.0,
+    "max_drawdown": 0.0,
+    "profit_factor": 0.0,
+    "num_trades": 0
+  }
+}
