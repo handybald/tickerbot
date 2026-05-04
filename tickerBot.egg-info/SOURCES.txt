@@ -13,3 +13,16 @@ tickerbot/indicators.py
 tickerbot/main.py
 tickerbot/suggestion.py
 tickerbot/trader.py
+tickerbot/core/__init__.py
+tickerbot/core/analytics.py
+tickerbot/core/backtester.py
+tickerbot/core/bot_service.py
+tickerbot/core/broker.py
+tickerbot/core/macro_sentiment.py
+tickerbot/core/market.py
+tickerbot/core/models.py
+tickerbot/core/reporting.py
+tickerbot/core/settings.py
+tickerbot/core/store.py
+tickerbot/core/strategy.py
+tickerbot/core/telegram_interface.py
