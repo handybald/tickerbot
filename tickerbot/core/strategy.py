@@ -26,7 +26,9 @@ TIMEFRAME_CONFIG = {
 
 # Timeframe weights for multi-timeframe combination.
 # Higher timeframe carries more weight in the final decision.
-_MTF_WEIGHTS = {"1d": 0.50, "1h": 0.35, "15m": 0.15}
+# 1wk/1mo are only present when the caller fetches them (e.g. debug_signals.py
+# for swing/position decisions); the live bot only fetches 15m/1h/1d.
+_MTF_WEIGHTS = {"1mo": 0.30, "1wk": 0.40, "1d": 0.50, "1h": 0.35, "15m": 0.15}
 
 # ADX threshold: below this value the market is considered range-bound.
 _ADX_TREND_THRESHOLD = 20.0
@@ -126,7 +128,7 @@ class StrategyManager:
         # ── Triple-screen rule ─────────────────────────────────────────
         # The highest available timeframe sets the allowed direction.
         trend_tf = next(
-            (tf for tf in ("1d", "1h", "15m") if tf in tf_results), None
+            (tf for tf in ("1mo", "1wk", "1d", "1h", "15m") if tf in tf_results), None
         )
         trend_action = tf_results[trend_tf]["action"] if trend_tf else "HOLD"
 

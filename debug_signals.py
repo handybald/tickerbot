@@ -65,6 +65,60 @@ def _fetch_macro(scope: str) -> dict[str, float]:
         return {"global": 0.0, "market": 0.0}
 
 
+def print_longterm_context(ticker: str) -> None:
+    """Long-horizon (weekly + monthly) context for swing/position decisions.
+
+    Independent of the bot's MTF aggregator — purely informational for human
+    holds of 2+ weeks. Fetches 1wk and 1mo candles directly.
+    """
+    print(f"\n{_BAR}")
+    print(f"  {ticker}  |  Long-term context (for 2+ week holds)")
+    print(_BAR)
+
+    for tf_label, period, interval in (("Weekly", "5y", "1wk"), ("Monthly", "max", "1mo")):
+        d = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
+        if d.empty or len(d) < 20:
+            print(f"  {tf_label:<8}: insufficient data")
+            continue
+
+        price = float(d["Close"].iloc[-1])
+        sma_short = calculate_sma(d, 20)
+        sma_long = calculate_sma(d, 50 if tf_label == "Weekly" else 12)
+        rsi = calculate_rsi(d)
+        macd, sig = calculate_macd(d)
+
+        s_short = float(sma_short.dropna().iloc[-1]) if not sma_short.dropna().empty else float("nan")
+        s_long = float(sma_long.dropna().iloc[-1]) if not sma_long.dropna().empty else float("nan")
+        rsi_v = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else 50.0
+        macd_v = float(macd.dropna().iloc[-1]) if not macd.dropna().empty else 0.0
+        sig_v = float(sig.dropna().iloc[-1]) if not sig.dropna().empty else 0.0
+        cross = macd_v - sig_v
+
+        trend = "UPTREND" if price > s_short > s_long else \
+                "DOWNTREND" if price < s_short < s_long else "MIXED"
+        rsi_lbl = "OVERSOLD" if rsi_v < 30 else ("OVERBOUGHT" if rsi_v > 70 else "neutral")
+        macd_lbl = "BULLISH" if cross > 0 else "BEARISH"
+
+        sma_short_lbl = "20" if tf_label == "Weekly" else "20"
+        sma_long_lbl = "50" if tf_label == "Weekly" else "12"
+
+        print(f"\n  {tf_label} ({len(d)} bars):")
+        print(f"    Price        : {price:.4f}")
+        print(f"    SMA{sma_short_lbl}/SMA{sma_long_lbl} : {s_short:.4f} / {s_long:.4f}  [{trend}]")
+        print(f"    RSI(14)      : {rsi_v:.2f}  [{rsi_lbl}]")
+        print(f"    MACD cross   : {cross:+.4f}  [{macd_lbl}]")
+
+        # 52-period range position (52 weeks for weekly, 12 months for monthly)
+        lookback = min(52 if tf_label == "Weekly" else 12, len(d))
+        window = d["Close"].tail(lookback)
+        hi, lo = float(window.max()), float(window.min())
+        if hi > lo:
+            pos = (price - lo) / (hi - lo) * 100
+            range_lbl = "near HIGH" if pos > 80 else ("near LOW" if pos < 20 else "mid-range")
+            range_name = "52-week" if tf_label == "Weekly" else "12-month"
+            print(f"    {range_name} range: {lo:.4f} … {hi:.4f}  position={pos:.0f}%  [{range_lbl}]")
+
+
 def analyze_ticker(
     ticker: str,
     strategy: str,
@@ -233,8 +287,14 @@ def analyze_ticker(
         params=params,
     )
 
-    tf_labels = {"1d": "trend frame", "1h": "setup frame", "15m": "entry frame"}
-    for tf_key in ("1d", "1h", "15m"):
+    tf_labels = {
+        "1mo": "macro trend",
+        "1wk": "swing trend",
+        "1d":  "trend frame",
+        "1h":  "setup frame",
+        "15m": "entry frame",
+    }
+    for tf_key in ("1mo", "1wk", "1d", "1h", "15m"):
         if tf_key in mtf.breakdown:
             s = mtf.breakdown[tf_key]
             lbl = tf_labels.get(tf_key, "")
@@ -404,10 +464,12 @@ def main() -> None:
             ticker_sentiment = _fetch_sentiment(ticker)
             print(f"{ticker_sentiment:+.3f}")
 
-        # Fetch all timeframes once
+        # Fetch all timeframes once. Add 1wk/1mo for swing/position context —
+        # the bot itself only fetches the frames in TIMEFRAME_CONFIG.
         print(f"Fetching data for {ticker} …")
         data_by_tf: dict[str, pd.DataFrame] = {}
-        for tf, (period, interval) in TIMEFRAME_CONFIG.items():
+        extra_tfs = {"1wk": ("5y", "1wk"), "1mo": ("max", "1mo")}
+        for tf, (period, interval) in {**TIMEFRAME_CONFIG, **extra_tfs}.items():
             d = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
             if not d.empty:
                 data_by_tf[tf] = d
@@ -416,6 +478,8 @@ def main() -> None:
         if not data_by_tf:
             print(f"  ERROR: no data for {ticker}")
             continue
+
+        print_longterm_context(ticker)
 
         for strat in strategies:
             analyze_ticker(ticker, strat, ticker_sentiment, macro, data_by_tf, params=opt_params)
