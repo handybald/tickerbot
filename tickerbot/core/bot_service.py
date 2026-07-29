@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 
 from .analytics import closed_trade_stats
 from .broker import PaperBrokerAdapter
-from .macro_sentiment import get_macro_sentiment, invalidate_cache as invalidate_macro_cache
 from .market import (
     CandleRequest,
     fetch_history,
@@ -54,12 +53,11 @@ class BotService:
         self._position_high_watermark: dict[str, float] = {}
         self._no_data_failures: dict[str, int] = {}
         self._no_data_block_until: dict[str, str] = {}
-        self._profit_halt_day: str = ""
-        # sentiment cache: ticker → (score, fetched_at_unix_ts)
-        self._sentiment_cache: dict[str, tuple[float, float]] = {}
-        self._sentiment_ttl: float = 4 * 3600.0   # refresh every 4 hours
 
         self._state_key = "runtime_state_v1"
+        # Day key (YYYY-MM-DD) on which the profit target halt was triggered;
+        # empty string means no halt is active.
+        self._profit_halt_day: str = ""
         self._restore_runtime_state()
 
     def run(self) -> None:
@@ -88,10 +86,10 @@ class BotService:
         settings = self.settings_store.load()
         self._apply_execution_settings(settings)
 
-        # Auto-clear profit halt when the calendar day rolls over.
+        # Auto-clear profit halt on a new calendar day.
         today = now_local.strftime("%Y-%m-%d")
         if self._profit_halt_day and self._profit_halt_day != today:
-            log.info("New trading day; profit halt cleared (was %s)", self._profit_halt_day)
+            log.info("New day %s - clearing profit halt from %s", today, self._profit_halt_day)
             self._profit_halt_day = ""
             self._persist_runtime_state()
 
@@ -164,13 +162,21 @@ class BotService:
             self.selected_timeframe,
         )
 
-        # Build live_data from already-fetched timeframe_data (avoids duplicate fetch).
-        # Use the selected timeframe's data as the primary price source.
-        primary_tf_data = timeframe_data.get(self.selected_timeframe, {})
-        # Fall back to any available timeframe if selected TF has no data.
-        if not primary_tf_data:
-            primary_tf_data = next(iter(timeframe_data.values()), {})
-        live_data = primary_tf_data
+        tf_period, tf_interval = TIMEFRAME_CONFIG.get(self.selected_timeframe, TIMEFRAME_CONFIG["1h"])
+        live_data = {}
+        for ticker in universe:
+            if self._is_ticker_blocked(ticker, now_local):
+                continue
+            try:
+                data = fetch_history(CandleRequest(ticker=ticker, period=tf_period, interval=tf_interval))
+                if not data.empty:
+                    self._clear_no_data_failure(ticker)
+                    live_data[ticker] = data
+                else:
+                    self._record_no_data_failure(ticker, settings, now_local)
+            except Exception as exc:
+                log.warning("live fetch failed for %s: %s", ticker, exc)
+                self._record_no_data_failure(ticker, settings, now_local)
 
         latest_prices = {t: float(df["Close"].iloc[-1]) for t, df in live_data.items() if not df.empty}
         if not latest_prices:
@@ -196,27 +202,34 @@ class BotService:
                 day_key,
             )
             self.telegram.send_message(
-                f"Risk halt triggered for {day_key}. Drawdown {daily_drawdown:.2%} exceeded {settings.max_daily_loss_pct:.2%}."
+                f"Risk halt triggered for {day_key}. "
+                f"Drawdown {daily_drawdown:.2%} exceeded "
+                f"{settings.max_daily_loss_pct:.2%}. Use /startbot tomorrow."
             )
             self.trading_enabled = False
             self._persist_runtime_state()
             return
 
-        # Daily profit target: stop new entries once gain threshold is reached.
-        if settings.daily_profit_target_enabled and not self._profit_halt_day:
+        # Daily profit target: pause new entries once the goal is reached.
+        if settings.daily_profit_target_enabled:
             daily_gain = (equity - day_start_equity) / max(day_start_equity, 1.0)
             if daily_gain >= settings.daily_profit_target_pct:
-                self._profit_halt_day = day_key
-                self._persist_runtime_state()
                 log.info(
                     "Profit target reached | gain=%.4f target=%.4f day=%s",
                     daily_gain,
                     settings.daily_profit_target_pct,
                     day_key,
                 )
-                self.telegram.send_message(
-                    f"Daily profit target reached for {day_key}! Gain {daily_gain:.2%} >= {settings.daily_profit_target_pct:.2%}. No new entries until tomorrow."
-                )
+                if self._profit_halt_day != day_key:
+                    self._profit_halt_day = day_key
+                    self.telegram.send_message(
+                        f"Daily profit target reached! "
+                        f"Gain {daily_gain:.2%} >= {settings.daily_profit_target_pct:.2%} "
+                        f"on {day_key}. No new entries until tomorrow."
+                    )
+                    self._persist_runtime_state()
+                # Allow exits to continue running but skip new entries.
+                # We set a flag and fall through to the exit-only pass below.
 
         regime_ok = True
         if settings.regime_filter_enabled:
@@ -245,38 +258,12 @@ class BotService:
         positions = self.broker.get_positions()
         buys = 0
         sells = 0
-        # Macro sentiment — fetched once per cycle, shared across all tickers.
-        try:
-            macro = get_macro_sentiment(settings.market_scope)
-            macro_net = macro.get("global", 0.0) * 0.4 + macro.get("market", 0.0) * 0.6
-        except Exception:
-            macro_net = 0.0
-        log.info("Macro sentiment | global=%.3f market=%.3f net=%.3f",
-                 macro.get("global", 0.0) if isinstance(macro, dict) else 0.0,
-                 macro.get("market", 0.0) if isinstance(macro, dict) else 0.0,
-                 macro_net)
-
         signal_snapshot = []
         buys_today = self._buys_today(now_local)
         exits_by_rule = 0
 
         for ticker, data in live_data.items():
-            ticker_sentiment = self._get_sentiment(ticker)
-
-            # Build per-ticker multi-timeframe data from the already-fetched universe.
-            ticker_data_by_tf = {
-                tf: timeframe_data[tf][ticker]
-                for tf in timeframe_data
-                if ticker in timeframe_data[tf]
-            }
-
-            mtf = self.strategy_manager.mtf_signal(
-                strategy=self.selected_strategy,
-                data_by_tf=ticker_data_by_tf,
-                ticker_sentiment=ticker_sentiment,
-                macro_sentiment=macro_net,
-            )
-            action, confidence = mtf.action, mtf.confidence
+            action, confidence = self.strategy_manager.signal(self.selected_strategy, self.selected_timeframe, data)
             price = float(latest_prices[ticker])
             positions = self.broker.get_positions()
             pos = positions.get(ticker)
@@ -324,8 +311,6 @@ class BotService:
                     "action": action,
                     "confidence": float(confidence),
                     "price": price,
-                    "sentiment": round(ticker_sentiment, 3),
-                    "alignment": f"{mtf.alignment}/{mtf.total_tfs}",
                 }
             )
             if action == "HOLD" or confidence < dynamic_min_conf:
@@ -335,9 +320,9 @@ class BotService:
             has_position = ticker in positions
 
             if action == "BUY":
-                if not regime_ok:
-                    continue
                 if self._profit_halt_day == day_key:
+                    continue   # profit target reached today - no new entries
+                if not regime_ok:
                     continue
                 if has_position:
                     continue
@@ -507,26 +492,23 @@ class BotService:
 
         if cmd in {"/help", "/start"}:
             return (
-                "Commands:\n"
-                "/status — equity, cash, open positions\n"
-                "/report — today's P&L report\n"
-                "/weeklyreport — weekly P&L summary\n"
-                "/signals [n] — top N signals from last cycle\n"
-                "/positions — open positions list\n"
-                "/settings — show all settings\n"
-                "/set <key> <value> — change a setting\n"
-                "  e.g. /set daily_profit_target_pct 0.03\n"
-                "  e.g. /set market_scope FOREX\n"
-                "/sync — sync ticker universe\n"
-                "/csv [days] — export trades CSV\n"
-                "/on — enable trading\n"
-                "/off — disable trading\n"
-                "/debug <ticker> — show indicator values & score\n"
-                "\nKey settings:\n"
-                "  market_scope: BIST30 | BIST | NASDAQ | FOREX\n"
-                "  daily_profit_target_enabled / daily_profit_target_pct\n"
-                "  stop_loss_pct / take_profit_pct / trailing_stop_pct\n"
-                "  max_open_positions / min_signal_confidence"
+                "TickerBot commands:\n"
+                "/status              - strategy, positions, cash\n"
+                "/positions           - open positions with PnL\n"
+                "/report              - today's trading report\n"
+                "/weeklyreport        - this week's summary\n"
+                "/debugsignals [n]    - top N signals by confidence\n"
+                "/settings            - all runtime settings\n"
+                "/set <key> <value>   - update a setting live\n"
+                "  markets: market_scope = BIST30 | BIST | NASDAQ | FOREX\n"
+                "  risk:    stop_loss_pct, take_profit_pct, trailing_stop_pct\n"
+                "  target:  daily_profit_target_pct (default 0.03 = 3%)\n"
+                "           daily_profit_target_enabled (true/false)\n"
+                "  loss:    max_daily_loss_pct (default 0.02 = 2%)\n"
+                "/syncuniverse        - force refresh market universe\n"
+                "/tradescsv [days]    - export trades to CSV\n"
+                "/startbot            - enable trading\n"
+                "/stopbot             - disable trading"
             )
 
         if cmd == "/status":
@@ -561,17 +543,17 @@ class BotService:
             latest_prices = self._latest_position_prices()
             return format_weekly_report(datetime.now(self.istanbul_tz), self.trade_store, self.broker, latest_prices)
 
-        if cmd.startswith("/debugsignals") or cmd.startswith("/signals"):
+        if cmd.startswith("/debugsignals"):
             parts = cmd.split(maxsplit=1)
             limit = 10
             if len(parts) == 2:
                 try:
                     limit = max(1, int(parts[1]))
                 except ValueError:
-                    return "Usage: /signals [n]"
+                    return "Usage: /debugsignals [n]"
             return self._format_debug_signals(limit=limit)
 
-        if cmd in {"/syncuniverse", "/sync"}:
+        if cmd == "/syncuniverse":
             scope = settings.market_scope.upper().strip()
             if scope in {"NASDAQ", "US"}:
                 synced = sync_us_universe()
@@ -579,12 +561,11 @@ class BotService:
             else:
                 synced = sync_bist_universe()
                 label = "BIST"
-            invalidate_macro_cache()
             if not synced:
                 return "Universe sync failed; keeping cached/fallback universe."
             return f"Universe synced. {label} symbols cached: {len(synced)}"
 
-        if cmd.startswith("/tradescsv") or cmd.startswith("/csv"):
+        if cmd.startswith("/tradescsv"):
             parts = cmd.split(maxsplit=1)
             days = 7
             if len(parts) == 2:
@@ -600,21 +581,15 @@ class BotService:
             )
             return f"Sent CSV export for last {days} day(s)."
 
-        if cmd in {"/startbot", "/on"}:
+        if cmd == "/startbot":
             self.trading_enabled = True
             self._persist_runtime_state()
             return "Trading enabled."
 
-        if cmd in {"/stopbot", "/off"}:
+        if cmd == "/stopbot":
             self.trading_enabled = False
             self._persist_runtime_state()
             return "Trading disabled."
-
-        if cmd.startswith("/debug"):
-            parts = cmd.split(maxsplit=1)
-            if len(parts) < 2:
-                return "Usage: /debug <ticker>  e.g. /debug GARAN.IS"
-            return self._debug_ticker(parts[1].strip().upper(), settings)
 
         if cmd.startswith("/set "):
             parts = cmd.split(maxsplit=2)
@@ -630,166 +605,6 @@ class BotService:
                 return f"Failed to update setting: {exc}"
 
         return "Unknown command. Send /help"
-
-    def _debug_ticker(self, ticker: str, settings: RuntimeSettings) -> str:
-        from tickerbot.indicators import (
-            calculate_adx, calculate_atr, calculate_bollinger_bands,
-            calculate_macd, calculate_obv, calculate_rsi, calculate_stochastic,
-            calculate_volume_ratio, calculate_williams_r,
-        )
-        from .strategy import _ADX_TREND_THRESHOLD, _MAX_ATR_PCT
-
-        # Fetch all timeframes for MTF analysis
-        ticker_data_by_tf = {}
-        for tf, (period, interval) in TIMEFRAME_CONFIG.items():
-            try:
-                d = fetch_history(CandleRequest(ticker=ticker, period=period, interval=interval))
-                if not d.empty:
-                    ticker_data_by_tf[tf] = d
-            except Exception:
-                pass
-
-        if not ticker_data_by_tf:
-            return f"No data for {ticker}"
-
-        tf = self.selected_timeframe
-        data = ticker_data_by_tf.get(tf) or next(iter(ticker_data_by_tf.values()))
-
-        price = float(data["Close"].iloc[-1])
-
-        rsi = calculate_rsi(data)
-        rsi_val = float(rsi.dropna().iloc[-1]) if not rsi.dropna().empty else 50.0
-
-        macd, sig_line = calculate_macd(data)
-        macd_last = float(macd.dropna().iloc[-1]) if not macd.dropna().empty else 0.0
-        sig_last = float(sig_line.dropna().iloc[-1]) if not sig_line.dropna().empty else 0.0
-        cross = macd_last - sig_last
-
-        upper_bb, lower_bb = calculate_bollinger_bands(data)
-        upper_val = float(upper_bb.dropna().iloc[-1]) if not upper_bb.dropna().empty else price * 1.05
-        lower_val = float(lower_bb.dropna().iloc[-1]) if not lower_bb.dropna().empty else price * 0.95
-
-        adx_val, dip_val, dim_val = 25.0, 0.0, 0.0
-        di_trend_bullish = True
-        try:
-            adx_s, di_plus, di_minus = calculate_adx(data)
-            if not adx_s.dropna().empty:
-                adx_val = float(adx_s.dropna().iloc[-1])
-                dip_val = float(di_plus.dropna().iloc[-1])
-                dim_val = float(di_minus.dropna().iloc[-1])
-                di_trend_bullish = dip_val > dim_val
-        except Exception:
-            pass
-
-        wr_val = -50.0
-        try:
-            wr = calculate_williams_r(data)
-            if not wr.dropna().empty:
-                wr_val = float(wr.dropna().iloc[-1])
-        except Exception:
-            pass
-
-        stoch_k_val = 50.0
-        try:
-            stoch_k, _ = calculate_stochastic(data)
-            if not stoch_k.dropna().empty:
-                stoch_k_val = float(stoch_k.dropna().iloc[-1])
-        except Exception:
-            pass
-
-        atr_penalty = 0.0
-        try:
-            atr = calculate_atr(data)
-            if not atr.dropna().empty and price > 0:
-                atr_pct = float(atr.dropna().iloc[-1]) / price
-                if atr_pct > _MAX_ATR_PCT:
-                    atr_penalty = min(0.25, (atr_pct - _MAX_ATR_PCT) / _MAX_ATR_PCT * 0.25)
-        except Exception:
-            pass
-
-        is_trending = adx_val >= _ADX_TREND_THRESHOLD
-        strategy = self.selected_strategy
-
-        # OBV trend
-        obv_rising = None
-        try:
-            obv = calculate_obv(data)
-            if not obv.dropna().empty and len(obv.dropna()) >= 20:
-                obv_sma = obv.rolling(20).mean()
-                obv_rising = float(obv.iloc[-1]) > float(obv_sma.dropna().iloc[-1])
-        except Exception:
-            pass
-
-        # Volume ratio
-        vol_ratio_val = None
-        try:
-            vr = calculate_volume_ratio(data)
-            if not vr.dropna().empty:
-                vol_ratio_val = float(vr.dropna().iloc[-1])
-        except Exception:
-            pass
-
-        # Macro sentiment
-        try:
-            macro = get_macro_sentiment(settings.market_scope)
-            macro_net = macro.get("global", 0.0) * 0.4 + macro.get("market", 0.0) * 0.6
-        except Exception:
-            macro_net = 0.0
-
-        ticker_sent = self._get_sentiment(ticker)
-        combined_sent = ticker_sent * 0.6 + macro_net * 0.4
-
-        # MTF signal
-        mtf = self.strategy_manager.mtf_signal(
-            strategy=strategy,
-            data_by_tf=ticker_data_by_tf,
-            ticker_sentiment=ticker_sent,
-            macro_sentiment=macro_net,
-        )
-
-        bb_pos = "above upper" if price > upper_val else "below lower" if price < lower_val else "inside"
-        trend_str = f"TRENDING ({'bull' if di_trend_bullish else 'bear'})" if is_trending else "RANGING"
-        obv_str = ("rising ↑" if obv_rising else "falling ↓") if obv_rising is not None else "n/a"
-        vol_str = f"{vol_ratio_val:.2f}x avg" if vol_ratio_val is not None else "n/a"
-
-        lines = [
-            f"Debug: {ticker}  [{tf} | {strategy}]",
-            f"Price    : {price:.4f}",
-            f"RSI      : {rsi_val:.1f}",
-            f"MACD Δ   : {cross:+.4f}  ({'bull' if cross > 0 else 'bear'})",
-            f"BB       : {bb_pos}  (lo={lower_val:.4f} hi={upper_val:.4f})",
-            f"ADX      : {adx_val:.1f}  {trend_str}  DI+={dip_val:.1f} DI-={dim_val:.1f}",
-            f"Wm%R     : {wr_val:.1f}",
-            f"Stoch    : {stoch_k_val:.1f}",
-            f"OBV      : {obv_str}",
-            f"Volume   : {vol_str}",
-            f"ATR pen  : {atr_penalty:.2f}",
-            f"Ticker sent: {ticker_sent:+.3f}  Macro: {macro_net:+.3f}  Combined: {combined_sent:+.3f}",
-            "",
-            "Multi-Timeframe:",
-        ]
-        for tfk in ("1d", "1h", "15m"):
-            if tfk in mtf.breakdown:
-                s = mtf.breakdown[tfk]
-                label = "trend" if tfk == "1d" else ("setup" if tfk == "1h" else "entry")
-                lines.append(f"  {tfk} ({label}): {s['action']:4s}  conf={s['confidence']:.2f}")
-        lines.append(f"  Alignment: {mtf.alignment}/{mtf.total_tfs} TFs agree")
-        lines.append(f"  >>> MTF: {mtf.action}  conf={mtf.confidence:.2f} <<<")
-        return "\n".join(lines)
-
-    def _get_sentiment(self, ticker: str) -> float:
-        """Return cached news sentiment for ticker, refreshing if stale."""
-        now_ts = time.time()
-        cached = self._sentiment_cache.get(ticker)
-        if cached and (now_ts - cached[1]) < self._sentiment_ttl:
-            return cached[0]
-        try:
-            from tickerbot.data_fetcher import DataFetcher
-            score = DataFetcher(ticker).get_sentiment()
-        except Exception:
-            score = 0.0
-        self._sentiment_cache[ticker] = (score, now_ts)
-        return score
 
     def _latest_position_prices(self) -> dict[str, float]:
         latest_prices = {}
@@ -816,16 +631,8 @@ class BotService:
             f"Top {len(top)} by confidence:",
         ]
         for row in top:
-            sent = row.get("sentiment", 0.0)
-            align = row.get("alignment", "")
-            extras = []
-            if sent != 0.0:
-                extras.append(f"sent={sent:+.2f}")
-            if align:
-                extras.append(f"align={align}")
-            extra_str = "  " + " ".join(extras) if extras else ""
             lines.append(
-                f"- {row['ticker']} {row['action']} conf={row['confidence']:.2f} price={row['price']:.2f}{extra_str}"
+                f"- {row['ticker']} {row['action']} conf={row['confidence']:.2f} price={row['price']:.2f}"
             )
         return "\n".join(lines)
 
@@ -837,7 +644,6 @@ class BotService:
         for bucket, row in stats.get("by_bucket", {}).items():
             if row.get("trades", 0) < 3:
                 continue
-            # Keep this influence bounded; heuristic score is still primary.
             bias[bucket] = max(-2.0, min(2.0, row.get("score", 0.0) / 5.0))
         return bias
 
@@ -863,18 +669,13 @@ class BotService:
     def _passes_liquidity_gate(self, ticker: str, data, settings: RuntimeSettings) -> bool:
         if data.empty or len(data) < 20:
             return False
-        # Forex / commodity pairs have no meaningful volume — skip the gate.
-        if is_forex_ticker(ticker):
-            return True
-        if "Volume" not in data.columns:
+        # Forex pairs don't have meaningful volume data in yfinance.
+        if is_forex_ticker(ticker) or "Volume" not in data.columns:
             return True
         avg_volume = float(data["Volume"].tail(20).mean())
         price = float(data["Close"].iloc[-1])
         turnover = avg_volume * price
-        # TRY turnover check only applies to BIST (.IS) tickers.
-        if ticker.endswith(".IS"):
-            return avg_volume >= settings.min_avg_volume and turnover >= settings.min_turnover_try
-        return avg_volume >= settings.min_avg_volume
+        return avg_volume >= settings.min_avg_volume and turnover >= settings.min_turnover_try
 
     def _exit_reason(self, pos, price: float, now_local: datetime, settings: RuntimeSettings) -> str:
         if not pos:
@@ -1016,7 +817,8 @@ class BotService:
     @staticmethod
     def _effective_regime_ticker(settings: RuntimeSettings) -> str:
         scope = settings.market_scope.upper().strip()
-        if scope == "FOREX" and settings.regime_ticker == "XU100.IS":
+        if scope == "FOREX" and settings.regime_ticker in {"XU100.IS", "QQQ"}:
+            # DXY (US Dollar Index) as a macro regime filter for forex.
             return "DX-Y.NYB"
         if scope in {"NASDAQ", "US"} and settings.regime_ticker == "XU100.IS":
             return "QQQ"

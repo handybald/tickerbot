@@ -49,7 +49,7 @@ def calculate_bollinger_bands(data, window=20, num_std_dev=2):
 
 def calculate_atr(data, window=14):
     """
-    Average True Range – measures volatility.
+    Average True Range - measures volatility.
     Used for dynamic stop-loss sizing and confidence scaling.
     Requires 'High', 'Low', 'Close' columns.
     """
@@ -87,7 +87,7 @@ def calculate_stochastic(data, k_window=14, d_window=3):
 
 def calculate_adx(data, window=14):
     """
-    Average Directional Index – measures trend strength (not direction).
+    Average Directional Index - measures trend strength (not direction).
     ADX > 25: trending market; ADX < 20: ranging/sideways market.
     Also returns DI+ and DI- for direction.
     Requires 'High', 'Low', 'Close' columns.
@@ -128,7 +128,7 @@ def calculate_adx(data, window=14):
 
 def calculate_williams_r(data, window=14):
     """
-    Williams %R – momentum oscillator.
+    Williams %R - momentum oscillator.
     Values near 0 = overbought; values near -100 = oversold.
     Typical thresholds: > -20 overbought, < -80 oversold.
     Requires 'High', 'Low', 'Close' columns.
@@ -140,33 +140,6 @@ def calculate_williams_r(data, window=14):
     denom = (high_max - low_min).replace(0, np.nan)
     wr = -100.0 * (high_max - data['Close']) / denom
     return wr
-
-
-def calculate_obv(data):
-    """
-    On-Balance Volume — running cumulative volume.
-    Adds volume on up-close days, subtracts on down-close days.
-    OBV rising = volume supports the price trend (confirmation).
-    OBV diverging from price = weakening trend (warning).
-    Requires 'Close' and 'Volume' columns.
-    """
-    if not {"Close", "Volume"}.issubset(data.columns):
-        return pd.Series(dtype=float, index=data.index)
-    direction = np.sign(data["Close"].diff()).fillna(0)
-    obv = (direction * data["Volume"]).cumsum()
-    return obv
-
-
-def calculate_volume_ratio(data, window: int = 20) -> pd.Series:
-    """
-    Current bar volume relative to the rolling average.
-    > 1.5 = above-average activity (confirms signal direction).
-    < 0.5 = below-average activity (signal less reliable).
-    """
-    if "Volume" not in data.columns:
-        return pd.Series(1.0, index=data.index)
-    avg = data["Volume"].rolling(window=window).mean().replace(0, np.nan)
-    return data["Volume"] / avg
 
 
 def calculate_vwap(data):

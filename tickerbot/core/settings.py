@@ -80,10 +80,7 @@ class SettingsStore:
                 self.save(defaults)
                 return defaults
             payload = json.loads(row[0])
-            # Field-filtered deserialization handles schema evolution safely.
-            known = {f for f in RuntimeSettings.__dataclass_fields__}
-            filtered = {k: v for k, v in payload.items() if k in known}
-            return RuntimeSettings(**filtered)
+            return RuntimeSettings(**payload)
 
     def save(self, settings: RuntimeSettings) -> None:
         payload = json.dumps(asdict(settings))

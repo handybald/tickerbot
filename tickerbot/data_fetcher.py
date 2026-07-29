@@ -68,8 +68,8 @@ class DataFetcher:
     def get_sentiment(self) -> float:
         """Returns a single [-1, 1] sentiment score for the ticker.
 
-        > 0.2  → bullish signal
-        < -0.2 → bearish signal
+        > 0.2  -> bullish signal
+        < -0.2 -> bearish signal
         """
         try:
             df = self.get_stock_news()
